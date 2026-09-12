@@ -42,7 +42,8 @@ namespace NiumaLauncher.ViewModel
 
         private double _downloadProgressPercent;
 
-
+        // 保存当前会话中的下载结果，不从界面提示文字反推数据。
+        private DownloadedGamePackage? _downloadedPackage;
 
         #endregion
 
@@ -182,6 +183,10 @@ namespace NiumaLauncher.ViewModel
                     : "取消下载"
                 : "下载更新";
 
+        public string DownloadedPackageText => _downloadedPackage is { } package
+            ? $"缓存包：{package.Version}（构建 {package.BuildNumber}），尚未安装"
+            : "缓存包：当前会话没有已完成的下载";
+
         #endregion
 
         #region Game Selection(游戏选择模块)
@@ -261,6 +266,7 @@ namespace NiumaLauncher.ViewModel
 
             // 不能把上一个选择对应的更新信息带到新选择中。
             SetAvailableRelease(null);
+            SetDownloadedPackage(null);
             DownloadProgressPercent = 0;
 
             OnPropertyChanged(nameof(GameExecutablePath));
@@ -455,6 +461,12 @@ namespace NiumaLauncher.ViewModel
             NotifyDownloadUi();
         }
 
+        private void SetDownloadedPackage(DownloadedGamePackage? package)
+        {
+            _downloadedPackage = package;
+            OnPropertyChanged(nameof(DownloadedPackageText));
+        }
+
         public void CancelDownload()
         {
             if (!IsDownloading ||
@@ -483,6 +495,8 @@ namespace NiumaLauncher.ViewModel
             using var cancellation = new CancellationTokenSource();
 
             _downloadCancellation = cancellation;
+            // 如果本次下载失败，不能继续把上次成功的结果当作本次结果。
+            SetDownloadedPackage(null);
             DownloadProgressPercent = 0;
 
             // 在第一个 await 前锁定操作，防止重复下载。
@@ -540,20 +554,21 @@ namespace NiumaLauncher.ViewModel
                 });
 
                 // ViewModel 需要回到 UI 线程，不使用 ConfigureAwait(false)。
-                string packagePath = await _packageDownloader.DownloadAsync(
+                DownloadedGamePackage package = await _packageDownloader.DownloadAsync(
                     release,
                     ReleaseFeedUri,
                     progress,
                     cancellation.Token);
 
+                SetDownloadedPackage(package);
                 DownloadProgressPercent = 100;
 
-                // 本轮已经下载成功，避免直接重复点击下载。
-                // 缓存文件仍保留在磁盘上。
+                // 下载候选与下载结果是两份不同的数据。
+                // 清空候选，不影响刚保存的下载结果。
                 SetAvailableRelease(null);
 
                 StatusText =
-                    $"下载并校验完成，尚未安装。缓存包：{packagePath}";
+                    $"下载并校验完成，尚未安装。缓存包：{package.FilePath}";
             }
             catch (OperationCanceledException)
             {

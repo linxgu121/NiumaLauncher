@@ -33,7 +33,7 @@ public sealed class GamePackageDownloader
 
     #region Download(下载与校验)
 
-    public async Task<string> DownloadAsync(
+    public async Task<DownloadedGamePackage> DownloadAsync(
         GameReleaseManifest release,
         Uri manifestUri,
         IProgress<PackageDownloadProgress>? progress = null,
@@ -47,10 +47,24 @@ public sealed class GamePackageDownloader
         // 保存本次下载参数，不在 await 之后反复读取外部可变对象。
         var package = new GameReleaseManifest
         {
+            GameId = release.GameId,
+            Version = release.Version,
+            BuildNumber = release.BuildNumber,
+
             PackageUrl = release.PackageUrl,
             PackageSizeBytes = release.PackageSizeBytes,
             PackageSha256 = release.PackageSha256
         };
+
+        // 下载结果需要携带有效身份。
+        // 是否属于当前游戏，仍由调用流程结合预期 GameId 判断。
+        if (string.IsNullOrWhiteSpace(package.GameId) ||
+            string.IsNullOrWhiteSpace(package.Version) ||
+            package.BuildNumber <= 0)
+        {
+            throw new InvalidDataException(
+                "发布包缺少有效的游戏身份或版本信息。");
+        }
 
         GameReleaseClient.ValidatePackage(package, manifestUri);
 
@@ -229,7 +243,13 @@ public sealed class GamePackageDownloader
             File.Move(partialPath, completedPath, overwrite: true);
             ownsPartialFile = false;
 
-            return completedPath;
+            return new DownloadedGamePackage(
+                package.GameId,
+                package.Version,
+                package.BuildNumber,
+                completedPath,
+                expectedSize,
+                expectedHash);
         }
         finally
         {

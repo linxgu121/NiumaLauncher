@@ -143,6 +143,11 @@
                            Foreground="#8F98A6"
                            Margin="0,0,0,10"/>
 
+                <TextBlock Text="{Binding DownloadedPackageText}"
+                           TextWrapping="Wrap"
+                           Foreground="#8F98A6"
+                           Margin="0,0,0,10"/>
+
                 <TextBlock Text="{Binding StatusText}"
                            TextWrapping="Wrap"
                            Foreground="#C7F36B"
