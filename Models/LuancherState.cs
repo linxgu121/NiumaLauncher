@@ -25,5 +25,10 @@ public enum LauncherState
     /// <summary>
     /// 监控失败不等于进程退出，暂时禁止重复启动。
     /// </summary>
-    ProcessStatusUnknown
+    ProcessStatusUnknown,
+
+    /// <summary>
+    /// 正在获取发布信息并比较版本。
+    /// </summary>
+    CheckingUpdates
 }

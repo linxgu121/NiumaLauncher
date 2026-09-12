@@ -14,7 +14,7 @@
     <Window.Resources>
         <!-- 统一按钮外观，后面的按钮可以覆盖背景和文字颜色。 -->
         <Style x:Key="LauncherButton"
-                TargetType="Button">
+               TargetType="Button">
             <Setter Property="Background"
                     Value="#C7F36B"/>
             <Setter Property="Foreground"
@@ -44,12 +44,12 @@
 
             <Style.Triggers>
                 <Trigger Property="IsMouseOver"
-                        Value="True">
+                         Value="True">
                     <Setter Property="Opacity"
                             Value="0.85"/>
                 </Trigger>
                 <Trigger Property="IsEnabled"
-                        Value="False">
+                         Value="False">
                     <Setter Property="Opacity"
                             Value="0.4"/>
                 </Trigger>
@@ -87,7 +87,7 @@
         </Border>
 
         <Grid Grid.Column="1"
-                Margin="32">
+              Margin="32">
             <Grid.RowDefinitions>
                 <!-- Auto 按内容决定高度，中间区域填满剩余空间。 -->
                 <RowDefinition Height="Auto"/>
@@ -106,11 +106,11 @@
                     Margin="0,0,0,24">
                 <Border.Background>
                     <LinearGradientBrush StartPoint="0,0"
-                            EndPoint="1,1">
+                                         EndPoint="1,1">
                         <GradientStop Color="#344737"
-                                Offset="0"/>
+                                      Offset="0"/>
                         <GradientStop Color="#1B2631"
-                                Offset="1"/>
+                                      Offset="1"/>
                     </LinearGradientBrush>
                 </Border.Background>
 
@@ -157,6 +157,14 @@
                             Margin="0,0,12,0"
                             IsEnabled="{Binding CanSelectGame}"
                             Click="SelectGameButton_Click"/>
+
+                    <Button Content="检查更新"
+                            Style="{StaticResource LauncherButton}"
+                            Background="#2C333E"
+                            Foreground="#F1F3F5"
+                            Margin="0,0,12,0"
+                            IsEnabled="{Binding CanCheckForUpdates}"
+                            Click="CheckForUpdatesButton_Click"/>
 
                     <Button Content="{Binding LaunchButtonText}"
                             Style="{StaticResource LauncherButton}"

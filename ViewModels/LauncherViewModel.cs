@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using NiumaLauncher.Models;
@@ -24,6 +25,11 @@ namespace NiumaLauncher.ViewModel
         private readonly GameBuildManifestReader _buildManifestReader = new();
 
         private string _localVersionText = "本地版本：未选择游戏";
+
+        private readonly GameReleaseClient _releaseClient = new();
+
+        // 开发阶段使用本机地址，正式发布时替换为 HTTPS 地址。
+        private static readonly Uri ReleaseFeedUri = new("http://127.0.0.1:8088/latest.json");
 
         #endregion
 
@@ -93,6 +99,7 @@ namespace NiumaLauncher.ViewModel
                 OnPropertyChanged(nameof(CanSelectGame));
                 OnPropertyChanged(nameof(CanLaunch));
                 OnPropertyChanged(nameof(LaunchButtonText));
+                OnPropertyChanged(nameof(CanCheckForUpdates));
             }
         }
 
@@ -104,6 +111,9 @@ namespace NiumaLauncher.ViewModel
 
         public bool CanLaunch => State == LauncherState.Ready;
 
+        // 本阶段只检查已经选择且路径有效的本地游戏。
+        public bool CanCheckForUpdates => State == LauncherState.Ready;
+
         public string LaunchButtonText => State switch
         {
             LauncherState.Ready => "开始游戏",
@@ -111,6 +121,7 @@ namespace NiumaLauncher.ViewModel
             LauncherState.Running => "游戏运行中",
             LauncherState.GameMissing => "游戏路径失效",
             LauncherState.ProcessStatusUnknown => "进程状态待确认",
+            LauncherState.CheckingUpdates => "正在检查更新",
             _ => "请选择游戏"
         };
 
@@ -264,6 +275,96 @@ namespace NiumaLauncher.ViewModel
             {
                 // 必须覆盖原来的显示，不能继续展示上一个游戏的版本。
                 LocalVersionText = $"本地版本：读取失败，{exception.Message}";
+            }
+        }
+
+        #endregion
+
+        #region Update Check(检查更新)
+
+        public async Task CheckForUpdatesAsync()
+        {
+            if (!CanCheckForUpdates)
+            {
+                return;
+            }
+
+            State = LauncherState.CheckingUpdates;
+            StatusText = "正在获取发布信息……";
+
+            try
+            {
+                GameReleaseManifest release = await _releaseClient.FetchAsync(
+                    ReleaseFeedUri,
+                    ExpectedGameId);
+
+                // 网络等待期间，本地文件可能被外部程序修改。
+                // 收到响应后重新读取，不能从界面文字反推本地版本。
+                if (!IsValidGameExecutable(GameExecutablePath))
+                {
+                    StatusText = "游戏路径已失效，无法比较版本。";
+                    return;
+                }
+
+                GameBuildManifest? local = _buildManifestReader.Load(
+                    GameExecutablePath,
+                    ExpectedGameId);
+
+                if (local == null)
+                {
+                    StatusText = "缺少本地版本清单，无法判断是否需要更新。";
+                    return;
+                }
+
+                if (release.BuildNumber > local.BuildNumber)
+                {
+                    StatusText =
+                        $"发现新版本 {release.Version}" +
+                        $"（构建 {release.BuildNumber}），" +
+                        $"本地构建 {local.BuildNumber}。尚未下载。";
+                }
+                else if (release.BuildNumber < local.BuildNumber)
+                {
+                    StatusText =
+                        $"本地构建 {local.BuildNumber} 高于发布端构建 " +
+                        $"{release.BuildNumber}，不执行自动降级。";
+                }
+                else if (!string.Equals(
+                             release.Version,
+                             local.Version,
+                             StringComparison.Ordinal))
+                {
+                    // 同一个构建编号应当对应同一份发布内容。
+                    StatusText =
+                        "构建编号相同，但版本文字不一致，请检查发布信息。";
+                }
+                else
+                {
+                    StatusText =
+                        $"本地构建与发布端一致：{local.Version}" +
+                        $"（构建 {local.BuildNumber}）。";
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                StatusText = "检查更新超时，请稍后重试。";
+            }
+            catch (Exception exception) when (
+                exception is HttpRequestException or
+                IOException or
+                UnauthorizedAccessException or
+                JsonException or
+                InvalidDataException)
+            {
+                StatusText = $"检查更新失败：{exception.Message}";
+            }
+            finally
+            {
+                // 检查失败不代表不能启动本地游戏。
+                // 检查期间禁止启动进程，因此这里可以重新判断空闲状态。
+                State = EvaluateIdleState();
+
+                RefreshLocalVersion();
             }
         }
 

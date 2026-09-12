@@ -43,4 +43,11 @@ public partial class MainWindow : Window
         // 实际业务方法返回 Task，便于等待和处理错误。
         await _viewModel.LaunchGameAsync();
     }
+
+    private async void CheckForUpdatesButton_Click(
+        object sender,
+        RoutedEventArgs e)
+    {
+        await _viewModel.CheckForUpdatesAsync();
+    }
 }

@@ -1,0 +1,25 @@
+# .NET / WPF build and publish output
+[Bb]in/
+[Oo]bj/
+/artifacts/
+
+# Local release-feed fixtures (latest.json and future test packages)
+/DevFeed/
+
+# IDE caches and per-user settings
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Generated test results, logs, and temporary files
+TestResults/
+*.trx
+*.log
+*.tmp
+
+# OS-generated files
+.DS_Store
+Thumbs.db
