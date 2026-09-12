@@ -14,7 +14,7 @@ namespace NiumaLauncher.ViewModel
 
         private string _gameExecutablePath = string.Empty;
         private string _statusText = "请选择已经打包完成的游戏程序";
-        private bool _isRunning;
+        private LauncherState _state = LauncherState.NoGameSelected;
 
         private readonly LauncherSettingsStore _settingsStore = new();
 
@@ -51,36 +51,45 @@ namespace NiumaLauncher.ViewModel
         }
 
         /// <summary>
-        /// 是否正在运行
-        /// 
-        /// 从提交启动请求到进程退出期间保持为 true，
-        /// 防止连续点击按钮重复启动。
+        /// 启动器当前状态。按钮权限和文字都从它推导。
         /// </summary>
-        public bool IsRunning
+        public LauncherState State
         {
-            get => _isRunning;
+            get => _state;
+
             private set
             {
-                if (_isRunning == value)
+                if (_state == value)
                 {
                     return;
                 }
 
-                _isRunning = value;
-                OnPropertyChanged();
+                _state = value;
 
-                // 这些属性依赖 IsRunning，也必须通知界面重新读取。
+                OnPropertyChanged();
                 OnPropertyChanged(nameof(CanSelectGame));
                 OnPropertyChanged(nameof(CanLaunch));
                 OnPropertyChanged(nameof(LaunchButtonText));
             }
         }
 
-        public bool CanSelectGame => !IsRunning;
+        // 使用允许列表，后续新增下载、安装等状态时不会意外开放按钮。
+        public bool CanSelectGame =>
+            State is LauncherState.NoGameSelected
+                or LauncherState.Ready
+                or LauncherState.GameMissing;
 
-        public bool CanLaunch => !IsRunning && !string.IsNullOrWhiteSpace(GameExecutablePath);
+        public bool CanLaunch => State == LauncherState.Ready;
 
-        public string LaunchButtonText => IsRunning ? "游戏运行中" : "开始游戏";
+        public string LaunchButtonText => State switch
+        {
+            LauncherState.Ready => "开始游戏",
+            LauncherState.Starting => "正在启动……",
+            LauncherState.Running => "游戏运行中",
+            LauncherState.GameMissing => "游戏路径失效",
+            LauncherState.ProcessStatusUnknown => "进程状态待确认",
+            _ => "请选择游戏"
+        };
 
         #endregion
 
@@ -88,7 +97,7 @@ namespace NiumaLauncher.ViewModel
 
         public void SelectGame(string executablePath)
         {
-            if (IsRunning)
+            if (!CanSelectGame)
             {
                 return;
             }
@@ -100,6 +109,8 @@ namespace NiumaLauncher.ViewModel
             }
 
             ApplyGameExecutablePath(executablePath);
+
+            State = LauncherState.Ready;
 
             try
             {
@@ -124,30 +135,31 @@ namespace NiumaLauncher.ViewModel
             {
                 LauncherSettings settings = _settingsStore.Load();
 
-                if (string.IsNullOrWhiteSpace(settings.GameExecutablePath))
+                // 保留失效路径，方便用户知道上次选择了哪个游戏。
+                ApplyGameExecutablePath(
+                    settings.GameExecutablePath ?? string.Empty);
+
+                State = EvaluateIdleState();
+
+                StatusText = State switch
                 {
-                    // 首次使用，没有需要恢复的游戏。
-                    return;
-                }
+                    LauncherState.Ready =>
+                        "已恢复上次选择的游戏，可以启动。",
 
-                if (!IsValidGameExecutable(settings.GameExecutablePath))
-                {
-                    StatusText =
-                        $"上次的游戏路径不可用，请重新选择：{settings.GameExecutablePath}";
+                    LauncherState.GameMissing =>
+                        $"上次的游戏路径不可用，请重新选择：{GameExecutablePath}",
 
-                    // 不立即覆盖配置，游戏所在的外置硬盘也可能只是没连接。
-                    return;
-                }
-
-                ApplyGameExecutablePath(settings.GameExecutablePath);
-
-                StatusText = "已恢复上次选择的游戏，可以启动。";
+                    _ => "请选择已经打包完成的游戏程序"
+                };
             }
             catch (Exception exception) when (
                 exception is IOException or
                 UnauthorizedAccessException or
                 JsonException)
             {
+                ApplyGameExecutablePath(string.Empty);
+                State = LauncherState.NoGameSelected;
+
                 StatusText = $"读取设置失败，请重新选择游戏：{exception.Message}";
             }
         }
@@ -173,6 +185,22 @@ namespace NiumaLauncher.ViewModel
                     StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// 仅在没有启动任务占用时，根据游戏路径判断可用状态。
+        /// 不负责判断游戏进程是否正在运行。
+        /// </summary>
+        private LauncherState EvaluateIdleState()
+        {
+            if (string.IsNullOrWhiteSpace(GameExecutablePath))
+            {
+                return LauncherState.NoGameSelected;
+            }
+
+            return IsValidGameExecutable(GameExecutablePath)
+                ? LauncherState.Ready
+                : LauncherState.GameMissing;
+        }
+
         #endregion
 
         #region Game Process(游戏进程模块)
@@ -184,30 +212,29 @@ namespace NiumaLauncher.ViewModel
                 return;
             }
 
+            // Ready 是上一次判断的结果，启动前仍然需要检查文件。
+            State = EvaluateIdleState();
 
-            // 选择后文件仍可能被移动或删除，启动前需要再次检查。
-            if (!File.Exists(GameExecutablePath))
+            if (State != LauncherState.Ready)
             {
-                // 清空当前选择，使“开始游戏”重新变为不可点击。
-                ApplyGameExecutablePath(string.Empty);
-
-                StatusText = "游戏程序已不存在，请重新选择。";
+                StatusText = "游戏程序已不存在或路径无效，请重新选择。";
                 return;
             }
-            IsRunning = true;
+
+            // 在创建进程之前锁住按钮，避免重复提交。
+            State = LauncherState.Starting;
             StatusText = "正在启动游戏……";
 
             try
             {
                 var startInfo = new ProcessStartInfo
                 {
-                    // 使用完整路径，包含空格也不需要手工添加引号。
                     FileName = GameExecutablePath,
 
-                    // 游戏使用相对路径访问文件时，以游戏目录为基准。
-                    WorkingDirectory = Path.GetDirectoryName(GameExecutablePath)!,
+                    // 游戏中的相对路径以游戏目录为基准。
+                    WorkingDirectory =
+                        Path.GetDirectoryName(GameExecutablePath)!,
 
-                    // 直接创建程序进程，方便追踪它的退出。
                     UseShellExecute = false
                 };
 
@@ -215,18 +242,30 @@ namespace NiumaLauncher.ViewModel
 
                 if (gameProcess == null)
                 {
-                    StatusText = "未能创建游戏进程。";
-                    return;
+                    throw new InvalidOperationException("未能创建游戏进程。");
                 }
 
+                State = LauncherState.Running;
                 StatusText = "游戏进程已启动。";
 
-                // 异步等待不会阻塞窗口，期间仍能拖动和操作启动器。
+                // 异步等待，不阻塞启动器窗口。
                 await gameProcess.WaitForExitAsync();
 
-                StatusText = gameProcess.ExitCode == 0
-                    ? "游戏已退出，可以再次启动。"
-                    : $"游戏进程已退出，退出码：{gameProcess.ExitCode}";
+                int exitCode = gameProcess.ExitCode;
+
+                // 已经确认进程退出，再检查游戏路径是否还有效。
+                State = EvaluateIdleState();
+
+                if (State == LauncherState.GameMissing)
+                {
+                    StatusText = "游戏已退出，但游戏路径已失效，请重新选择。";
+                }
+                else
+                {
+                    StatusText = exitCode == 0
+                        ? "游戏已退出，可以再次启动。"
+                        : $"游戏进程已退出，退出码：{exitCode}";
+                }
             }
             catch (Exception exception) when (
                 exception is Win32Exception or
@@ -234,15 +273,24 @@ namespace NiumaLauncher.ViewModel
                 IOException or
                 UnauthorizedAccessException)
             {
-                StatusText = $"启动或监控游戏失败：{exception.Message}";
-            }
-            finally
-            {
-                // 正常退出和失败都要解除本次启动占用。
-                IsRunning = false;
+                if (State == LauncherState.Running)
+                {
+                    // 进程已经创建，等待异常不能当作游戏已经退出。
+                    State = LauncherState.ProcessStatusUnknown;
+
+                    StatusText =
+                        $"进程监控失败：{exception.Message}。" +
+                        "请确认游戏已关闭后，再重启启动器。";
+                }
+                else
+                {
+                    // 尚未进入运行状态，可以根据路径恢复重试能力。
+                    State = EvaluateIdleState();
+
+                    StatusText = $"启动游戏失败：{exception.Message}";
+                }
             }
         }
-
         #endregion
 
         #region Property Notifications(属性通知模块)
