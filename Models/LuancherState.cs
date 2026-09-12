@@ -30,5 +30,15 @@ public enum LauncherState
     /// <summary>
     /// 正在获取发布信息并比较版本。
     /// </summary>
-    CheckingUpdates
+    CheckingUpdates,
+    
+    /// <summary>
+    /// 正在把发布包下载到缓存。
+    /// </summary>
+    DownloadingPackage,
+
+    /// <summary>
+    /// 传输完成，正在校验磁盘文件。
+    /// </summary>
+    VerifyingPackage
 }

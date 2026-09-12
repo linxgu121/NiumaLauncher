@@ -50,4 +50,17 @@ public partial class MainWindow : Window
     {
         await _viewModel.CheckForUpdatesAsync();
     }
+
+    private async void DownloadPackageButton_Click(
+        object sender,
+        RoutedEventArgs e)
+    {
+        if (_viewModel.IsDownloading)
+        {
+            _viewModel.CancelDownload();
+            return;
+        }
+
+        await _viewModel.DownloadPackageAsync();
+    }
 }

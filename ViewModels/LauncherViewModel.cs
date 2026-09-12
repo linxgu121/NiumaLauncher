@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using NiumaLauncher.Models;
 using NiumaLauncher.Services;
@@ -30,6 +31,18 @@ namespace NiumaLauncher.ViewModel
 
         // 开发阶段使用本机地址，正式发布时替换为 HTTPS 地址。
         private static readonly Uri ReleaseFeedUri = new("http://127.0.0.1:8088/latest.json");
+
+        private readonly GamePackageDownloader _packageDownloader = new();
+
+        // 只有检查确认存在新版本后，才保存下载候选。
+        private GameReleaseManifest? _availableRelease;
+
+        // 每次下载创建独立的取消源，不复用已经取消的对象。
+        private CancellationTokenSource? _downloadCancellation;
+
+        private double _downloadProgressPercent;
+
+
 
         #endregion
 
@@ -100,6 +113,7 @@ namespace NiumaLauncher.ViewModel
                 OnPropertyChanged(nameof(CanLaunch));
                 OnPropertyChanged(nameof(LaunchButtonText));
                 OnPropertyChanged(nameof(CanCheckForUpdates));
+                NotifyDownloadUi();
             }
         }
 
@@ -122,8 +136,51 @@ namespace NiumaLauncher.ViewModel
             LauncherState.GameMissing => "游戏路径失效",
             LauncherState.ProcessStatusUnknown => "进程状态待确认",
             LauncherState.CheckingUpdates => "正在检查更新",
+            LauncherState.DownloadingPackage => "正在下载更新",
+            LauncherState.VerifyingPackage => "正在校验更新",
             _ => "请选择游戏"
         };
+
+        public double DownloadProgressPercent
+        {
+            get => _downloadProgressPercent;
+
+            private set
+            {
+                if (_downloadProgressPercent == value)
+                {
+                    return;
+                }
+
+                _downloadProgressPercent = value;
+                OnPropertyChanged();
+            }
+        }
+
+        public bool IsDownloading =>
+            State is LauncherState.DownloadingPackage
+                or LauncherState.VerifyingPackage;
+
+        public bool IsVerifyingPackage =>
+            State == LauncherState.VerifyingPackage;
+
+        public bool CanDownloadPackage =>
+            State == LauncherState.Ready &&
+            _availableRelease is not null;
+
+        // 同一个按钮：空闲时下载，工作时取消。
+        // 请求取消后暂时禁用，等任务真正结束。
+        public bool CanUseDownloadButton =>
+            IsDownloading
+                ? _downloadCancellation is { IsCancellationRequested: false }
+                : CanDownloadPackage;
+
+        public string DownloadButtonText =>
+            IsDownloading
+                ? _downloadCancellation?.IsCancellationRequested == true
+                    ? "正在取消……"
+                    : "取消下载"
+                : "下载更新";
 
         #endregion
 
@@ -201,6 +258,10 @@ namespace NiumaLauncher.ViewModel
         private void ApplyGameExecutablePath(string executablePath)
         {
             _gameExecutablePath = executablePath;
+
+            // 不能把上一个选择对应的更新信息带到新选择中。
+            SetAvailableRelease(null);
+            DownloadProgressPercent = 0;
 
             OnPropertyChanged(nameof(GameExecutablePath));
 
@@ -289,6 +350,9 @@ namespace NiumaLauncher.ViewModel
                 return;
             }
 
+            SetAvailableRelease(null);
+            DownloadProgressPercent = 0;
+
             State = LauncherState.CheckingUpdates;
             StatusText = "正在获取发布信息……";
 
@@ -318,10 +382,14 @@ namespace NiumaLauncher.ViewModel
 
                 if (release.BuildNumber > local.BuildNumber)
                 {
+                    SetAvailableRelease(release);
+
                     StatusText =
-                        $"发现新版本 {release.Version}" +
-                        $"（构建 {release.BuildNumber}），" +
-                        $"本地构建 {local.BuildNumber}。尚未下载。";
+                       $"发现新版本 {release.Version}" +
+                       $"（构建 {release.BuildNumber}），" +
+                       $"本地构建 {local.BuildNumber}。" +
+                       $"发布包：{release.PackageSizeBytes / (1024d * 1024d):F2} MiB。" +
+                       "尚未下载。";
                 }
                 else if (release.BuildNumber < local.BuildNumber)
                 {
@@ -364,6 +432,151 @@ namespace NiumaLauncher.ViewModel
                 // 检查期间禁止启动进程，因此这里可以重新判断空闲状态。
                 State = EvaluateIdleState();
 
+                RefreshLocalVersion();
+            }
+        }
+
+        #endregion
+
+        #region Package Download(发布包下载)
+
+        private void NotifyDownloadUi()
+        {
+            OnPropertyChanged(nameof(IsDownloading));
+            OnPropertyChanged(nameof(IsVerifyingPackage));
+            OnPropertyChanged(nameof(CanDownloadPackage));
+            OnPropertyChanged(nameof(CanUseDownloadButton));
+            OnPropertyChanged(nameof(DownloadButtonText));
+        }
+
+        private void SetAvailableRelease(GameReleaseManifest? release)
+        {
+            _availableRelease = release;
+            NotifyDownloadUi();
+        }
+
+        public void CancelDownload()
+        {
+            if (!IsDownloading ||
+                _downloadCancellation is not
+                { IsCancellationRequested: false } cancellation)
+            {
+                return;
+            }
+
+            // 这里只请求取消，不能立即恢复 Ready。
+            // 文件关闭和临时文件清理由下载器完成。
+            cancellation.Cancel();
+
+            NotifyDownloadUi();
+            StatusText = "正在取消，等待下载任务结束……";
+        }
+
+        public async Task DownloadPackageAsync()
+        {
+            if (!CanDownloadPackage ||
+                _availableRelease is not GameReleaseManifest release)
+            {
+                return;
+            }
+
+            using var cancellation = new CancellationTokenSource();
+
+            _downloadCancellation = cancellation;
+            DownloadProgressPercent = 0;
+
+            // 在第一个 await 前锁定操作，防止重复下载。
+            State = LauncherState.DownloadingPackage;
+            StatusText = "正在准备下载……";
+
+            try
+            {
+                // 检查更新以后，本地文件仍可能被其他程序修改。
+                if (!IsValidGameExecutable(GameExecutablePath))
+                {
+                    SetAvailableRelease(null);
+                    StatusText = "游戏路径已失效，请重新选择并检查更新。";
+                    return;
+                }
+
+                GameBuildManifest? local = _buildManifestReader.Load(
+                    GameExecutablePath,
+                    ExpectedGameId);
+
+                if (local == null ||
+                    release.BuildNumber <= local.BuildNumber)
+                {
+                    SetAvailableRelease(null);
+                    StatusText = "本地版本信息已变化，请重新检查更新。";
+                    return;
+                }
+
+                // 本方法由 WPF 点击事件调用。
+                // 在 UI 线程创建 Progress，使回调回到 UI 线程。
+                var progress = new Progress<PackageDownloadProgress>(report =>
+                {
+                    // 排队中的旧进度不能覆盖任务结束后的提示，
+                    // 也不能覆盖“正在取消”的提示。
+                    if (!ReferenceEquals(_downloadCancellation, cancellation) ||
+                        cancellation.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    DownloadProgressPercent = report.Percentage;
+
+                    if (report.IsVerifying)
+                    {
+                        State = LauncherState.VerifyingPackage;
+                        StatusText = "传输完成，正在校验发布包……";
+                    }
+                    else
+                    {
+                        StatusText =
+                            $"正在下载：{report.Percentage:F1}% " +
+                            $"（{report.DownloadedBytes / (1024d * 1024d):F2} / " +
+                            $"{report.TotalBytes / (1024d * 1024d):F2} MiB）";
+                    }
+                });
+
+                // ViewModel 需要回到 UI 线程，不使用 ConfigureAwait(false)。
+                string packagePath = await _packageDownloader.DownloadAsync(
+                    release,
+                    ReleaseFeedUri,
+                    progress,
+                    cancellation.Token);
+
+                DownloadProgressPercent = 100;
+
+                // 本轮已经下载成功，避免直接重复点击下载。
+                // 缓存文件仍保留在磁盘上。
+                SetAvailableRelease(null);
+
+                StatusText =
+                    $"下载并校验完成，尚未安装。缓存包：{packagePath}";
+            }
+            catch (OperationCanceledException)
+            {
+                StatusText = cancellation.IsCancellationRequested
+                    ? "下载已取消，可以重试。"
+                    : "下载或校验超时，请重试。";
+            }
+            catch (Exception exception) when (
+                exception is HttpRequestException or
+                IOException or
+                UnauthorizedAccessException or
+                InvalidDataException or
+                JsonException or
+                CryptographicException)
+            {
+                StatusText = $"下载失败：{exception.Message}";
+            }
+            finally
+            {
+                // 先让排队中的旧回调失效，再恢复界面操作。
+                _downloadCancellation = null;
+
+                State = EvaluateIdleState();
                 RefreshLocalVersion();
             }
         }

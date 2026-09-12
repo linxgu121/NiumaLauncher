@@ -70,6 +70,7 @@ public class GameReleaseClient
             ?? throw new JsonException("发布清单不能为 null。");
 
         Validate(manifest, expectedGameId);
+        ValidatePackage(manifest, manifestUri);
 
         return manifest;
     }
@@ -82,7 +83,7 @@ public class GameReleaseClient
         GameReleaseManifest manifest,
         string expectedGameId)
     {
-        if (manifest.SchemaVersion != 1)
+        if (manifest.SchemaVersion != 2)
         {
             throw new InvalidDataException("不支持的发布清单格式。");
         }
@@ -104,6 +105,54 @@ public class GameReleaseClient
         if (manifest.BuildNumber <= 0)
         {
             throw new InvalidDataException("发布构建编号必须大于 0。");
+        }
+    }
+
+    internal static void ValidatePackage(
+        GameReleaseManifest manifest,
+        Uri manifestUri)
+    {
+        if (!Uri.TryCreate(
+                manifest.PackageUrl,
+                UriKind.Absolute,
+                out Uri? packageUri))
+        {
+            throw new InvalidDataException("发布包下载地址无效。");
+        }
+
+        // HTTP 只用于本机调试，而且包与清单必须来自同一个服务。
+        bool isLocalDebugPackage =
+            manifestUri.Scheme == Uri.UriSchemeHttp &&
+            manifestUri.IsLoopback &&
+            packageUri.Scheme == Uri.UriSchemeHttp &&
+            packageUri.IsLoopback &&
+            string.Equals(
+                manifestUri.Authority,
+                packageUri.Authority,
+                StringComparison.OrdinalIgnoreCase);
+
+        if (packageUri.Scheme != Uri.UriSchemeHttps &&!isLocalDebugPackage)
+        {
+            throw new InvalidDataException("发布包必须使用 HTTPS，本机同源调试地址除外。");
+        }
+
+        // 不在下载地址中携带用户名、密码或页面片段。
+        if (!string.IsNullOrEmpty(packageUri.UserInfo) ||
+            !string.IsNullOrEmpty(packageUri.Fragment))
+        {
+            throw new InvalidDataException("发布包地址不能包含用户凭据或 # 片段。");
+        }
+
+        if (manifest.PackageSizeBytes <= 0)
+        {
+            throw new InvalidDataException("发布包字节数必须大于 0。");
+        }
+
+        if (string.IsNullOrWhiteSpace(manifest.PackageSha256) ||
+            manifest.PackageSha256.Length != 64 ||
+            !manifest.PackageSha256.All(Uri.IsHexDigit))
+        {
+            throw new InvalidDataException("发布包 SHA-256 必须是 64 位十六进制字符串。");
         }
     }
 
