@@ -2,6 +2,9 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
+using NiumaLauncher.Models;
+using NiumaLauncher.Services;
 
 namespace NiumaLauncher.ViewModel
 {
@@ -12,6 +15,17 @@ namespace NiumaLauncher.ViewModel
         private string _gameExecutablePath = string.Empty;
         private string _statusText = "请选择已经打包完成的游戏程序";
         private bool _isRunning;
+
+        private readonly LauncherSettingsStore _settingsStore = new();
+
+        #endregion
+
+        #region Initialization(初始化)
+
+        public LauncherViewModel()
+        {
+            RestoreGameSelection();
+        }
 
         #endregion
 
@@ -71,7 +85,7 @@ namespace NiumaLauncher.ViewModel
         #endregion
 
         #region Game Selection(游戏选择模块)
-        
+
         public void SelectGame(string executablePath)
         {
             if (IsRunning)
@@ -79,8 +93,77 @@ namespace NiumaLauncher.ViewModel
                 return;
             }
 
+            if (!IsValidGameExecutable(executablePath))
+            {
+                StatusText = "请选择存在的游戏 .exe 文件。";
+                return;
+            }
 
-            bool isValid =
+            ApplyGameExecutablePath(executablePath);
+
+            try
+            {
+                _settingsStore.Save(new LauncherSettings
+                {
+                    GameExecutablePath = executablePath
+                });
+
+                StatusText = "已选择并保存游戏路径，可以启动。";
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException)
+            {
+                // 保存失败不影响本次使用已经选择的游戏。
+                StatusText = $"本次可以启动，但路径保存失败：{exception.Message}";
+            }
+        }
+
+        private void RestoreGameSelection()
+        {
+            try
+            {
+                LauncherSettings settings = _settingsStore.Load();
+
+                if (string.IsNullOrWhiteSpace(settings.GameExecutablePath))
+                {
+                    // 首次使用，没有需要恢复的游戏。
+                    return;
+                }
+
+                if (!IsValidGameExecutable(settings.GameExecutablePath))
+                {
+                    StatusText =
+                        $"上次的游戏路径不可用，请重新选择：{settings.GameExecutablePath}";
+
+                    // 不立即覆盖配置，游戏所在的外置硬盘也可能只是没连接。
+                    return;
+                }
+
+                ApplyGameExecutablePath(settings.GameExecutablePath);
+
+                StatusText = "已恢复上次选择的游戏，可以启动。";
+            }
+            catch (Exception exception) when (
+                exception is IOException or
+                UnauthorizedAccessException or
+                JsonException)
+            {
+                StatusText = $"读取设置失败，请重新选择游戏：{exception.Message}";
+            }
+        }
+
+        private void ApplyGameExecutablePath(string executablePath)
+        {
+            _gameExecutablePath = executablePath;
+
+            // 路径变化后，文本和启动按钮都要重新读取属性。
+            OnPropertyChanged(nameof(GameExecutablePath));
+            OnPropertyChanged(nameof(CanLaunch));
+        }
+
+        private static bool IsValidGameExecutable(string? executablePath)
+        {
+            return
                 !string.IsNullOrWhiteSpace(executablePath) &&
                 Path.IsPathFullyQualified(executablePath) &&
                 File.Exists(executablePath) &&
@@ -88,19 +171,6 @@ namespace NiumaLauncher.ViewModel
                     Path.GetExtension(executablePath),
                     ".exe",
                     StringComparison.OrdinalIgnoreCase);
-
-            if (!isValid)
-            {
-                StatusText = "请选择存在的游戏 .exe 文件。";
-                return;
-            }
-
-            _gameExecutablePath = executablePath;
-
-            OnPropertyChanged(nameof(GameExecutablePath));
-            OnPropertyChanged(nameof(CanLaunch));
-
-            StatusText = "已选择游戏，可以启动。";
         }
 
         #endregion
@@ -113,15 +183,17 @@ namespace NiumaLauncher.ViewModel
             {
                 return;
             }
-                
+
 
             // 选择后文件仍可能被移动或删除，启动前需要再次检查。
             if (!File.Exists(GameExecutablePath))
             {
+                // 清空当前选择，使“开始游戏”重新变为不可点击。
+                ApplyGameExecutablePath(string.Empty);
+
                 StatusText = "游戏程序已不存在，请重新选择。";
                 return;
             }
-
             IsRunning = true;
             StatusText = "正在启动游戏……";
 
