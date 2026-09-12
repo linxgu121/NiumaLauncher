@@ -18,6 +18,13 @@ namespace NiumaLauncher.ViewModel
 
         private readonly LauncherSettingsStore _settingsStore = new();
 
+        // 当前启动器页面对应的游戏身份，必须与清单一致。
+        private const string ExpectedGameId = "niuma-project";
+
+        private readonly GameBuildManifestReader _buildManifestReader = new();
+
+        private string _localVersionText = "本地版本：未选择游戏";
+
         #endregion
 
         #region Initialization(初始化)
@@ -32,6 +39,22 @@ namespace NiumaLauncher.ViewModel
         #region Bindable Properties(可绑定属性区域)
 
         public string GameExecutablePath => _gameExecutablePath;
+
+        public string LocalVersionText
+        {
+            get => _localVersionText;
+
+            private set
+            {
+                if (_localVersionText == value)
+                {
+                    return;
+                }
+
+                _localVersionText = value;
+                OnPropertyChanged();
+            }
+        }
 
         public string StatusText
         {
@@ -168,11 +191,11 @@ namespace NiumaLauncher.ViewModel
         {
             _gameExecutablePath = executablePath;
 
-            // 路径变化后，文本和启动按钮都要重新读取属性。
             OnPropertyChanged(nameof(GameExecutablePath));
-            OnPropertyChanged(nameof(CanLaunch));
-        }
 
+            // 用户重新选择，或者启动时恢复路径，都需要重新读取版本。
+            RefreshLocalVersion();
+        }
         private static bool IsValidGameExecutable(string? executablePath)
         {
             return
@@ -199,6 +222,49 @@ namespace NiumaLauncher.ViewModel
             return IsValidGameExecutable(GameExecutablePath)
                 ? LauncherState.Ready
                 : LauncherState.GameMissing;
+        }
+
+        #endregion
+
+        #region Local Version(本地版本信息)
+
+        private void RefreshLocalVersion()
+        {
+            if (string.IsNullOrWhiteSpace(GameExecutablePath))
+            {
+                LocalVersionText = "本地版本：未选择游戏";
+                return;
+            }
+
+            if (!IsValidGameExecutable(GameExecutablePath))
+            {
+                LocalVersionText = "本地版本：游戏路径不可用";
+                return;
+            }
+
+            try
+            {
+                GameBuildManifest? manifest = _buildManifestReader.Load(
+                    GameExecutablePath,
+                    ExpectedGameId);
+
+                if (manifest == null)
+                {
+                    LocalVersionText = "本地版本：未提供 game-build.json";
+                    return;
+                }
+
+                LocalVersionText = $"本地版本：{manifest.Version}（构建 {manifest.BuildNumber}）";
+            }
+            catch (Exception exception) when (
+                exception is IOException or
+                UnauthorizedAccessException or
+                JsonException or
+                InvalidDataException)
+            {
+                // 必须覆盖原来的显示，不能继续展示上一个游戏的版本。
+                LocalVersionText = $"本地版本：读取失败，{exception.Message}";
+            }
         }
 
         #endregion

@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("NiumaLauncher")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f086c2ca13682842a7375d7f1de5561eb62e56d4")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a4da51723ebbf919d329eb8a3c0def2596e6cc1e")]
 [assembly: System.Reflection.AssemblyProductAttribute("NiumaLauncher")]
 [assembly: System.Reflection.AssemblyTitleAttribute("NiumaLauncher")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
