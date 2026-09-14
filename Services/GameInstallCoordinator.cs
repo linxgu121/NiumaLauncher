@@ -126,6 +126,42 @@ internal static class GameInstallCoordinator
         session.VerifyGameDirectoryAtBackup();
     }
 
+    /// <summary>
+    /// 旧目录备份成功后，将候选移入正式游戏位置。
+    /// 必须由完整安装流程在同一个持锁会话内串行调用。
+    /// 本方法不负责重启恢复，也不表示安装已经完成。
+    /// </summary>
+    private static void MoveCandidateToGame(GameInstallSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        GameInstallPlan plan = session.Plan;
+
+        GamePackageStager.RevalidateCandidateAfterBackup(session);
+
+        // 清单读取后重新观察游戏进程与目录布局。
+        session.VerifyNoMatchingGameProcess();
+        session.VerifyBeforeCandidateMove();
+
+        var transactionStore = new GameInstallTransactionStore();
+
+        // 内部重新核对计划及 BackupMovePending 前置阶段。
+        // 登记失败会抛异常，不会继续移动。
+        _ = transactionStore.MarkCandidateMovePending(
+            plan,
+            session.ExpectedGameId);
+
+        // 意图发布期间路径可能变化，移动前再次检查。
+        session.VerifyBeforeCandidateMove();
+
+        Directory.Move(
+            plan.CandidateDirectoryPath,
+            plan.GameDirectoryPath);
+
+        // 使用原候选身份检查正式位置，不重新捕获基线。
+        session.VerifyAfterCandidateMove();
+    }
+
     #endregion
 
     #region Session Lifetime(会话生命周期)
