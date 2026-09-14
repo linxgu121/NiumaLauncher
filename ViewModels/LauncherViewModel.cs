@@ -4,6 +4,7 @@ using System.IO;
 using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using NiumaLauncher.Models;
 using NiumaLauncher.Services;
@@ -15,8 +16,8 @@ namespace NiumaLauncher.ViewModel
         #region Runtime State(运行时状态)
 
         private string _gameExecutablePath = string.Empty;
-        private string _statusText = "请选择已经打包完成的游戏程序";
-        private LauncherState _state = LauncherState.NoGameSelected;
+        private string _statusText = "正在等待启动检查……";
+        private LauncherState _state = LauncherState.CheckingInstallation;
 
         private readonly LauncherSettingsStore _settingsStore = new();
 
@@ -45,13 +46,171 @@ namespace NiumaLauncher.ViewModel
         // 保存当前会话中的下载结果，不从界面提示文字反推数据。
         private DownloadedGamePackage? _downloadedPackage;
 
+        private readonly GamePackageStager _packageStager = new();
+
+        // 每次准备创建独立取消源。
+        private CancellationTokenSource? _stagingCancellation;
+
+        // 暂存成功只是准备完成，不代表安装完成。
+        private StagedGamePackage? _stagedPackage;
+
+        private readonly GameInstallPlanBuilder _installPlanBuilder = new();
+
+        // 负责安装事务的发现、读取和汇总。
+        private readonly GameInstallTransactionStore _transactionStore = new();
+
+        // 同一个 ViewModel 生命周期只执行一次启动初始化。
+        private Task? _initializationTask;
+
+        // 保留完整报告，后续用于展示待处理事务详情。
+        private InstallTransactionInspection? _startupInspection;
+
+        // 独立保留诊断信息，不从随操作变化的 StatusText 反推。
+        private string _startupInitializationError = string.Empty;
+
+        // 只表示本轮启动事务检查通过，不是永久安装权限。
+        private bool _startupInspectionPassed;
+
+        // 只由 UI 线程读写，防止同一检查尚未结束时重复进入。
+        private bool _isStartupInspectionRunning;
+
+        // 游戏选择只恢复一次，重新检查不能覆盖本次会话的选择。
+        private bool _hasRestoredGameSelection;
+
         #endregion
 
-        #region Initialization(初始化)
+        #region Installation Inspection(安装状态检查)
 
-        public LauncherViewModel()
+        /// <summary>
+        /// 由窗口 UI 线程调用；首次初始化任务只创建一次。
+        /// 主动重新检查使用独立入口，不清空这个任务。
+        /// </summary>
+        public Task InitializeAsync()
         {
-            RestoreGameSelection();
+            return _initializationTask ??= RunStartupInspectionAsync();
+        }
+
+        /// <summary>
+        /// 由 UI 线程主动请求新一轮检查。
+        /// 不允许与游戏运行、下载或其它检查交叉执行。
+        /// </summary>
+        public Task RecheckStartupInspectionAsync()
+        {
+            if (!CanRecheckStartupInspection)
+            {
+                return Task.CompletedTask;
+            }
+
+            return RunStartupInspectionAsync();
+        }
+
+        /// <summary>
+        /// 首次启动和主动重新检查共用的检查流程。
+        /// 后台只读取事务，界面状态仍在 UI 线程更新。
+        /// </summary>
+        private async Task RunStartupInspectionAsync()
+        {
+            // 必须在第一次 await 前关闭操作权限。
+            _isStartupInspectionRunning = true;
+            _startupInspectionPassed = false;
+
+            // 本轮失败时，不能继续展示上一轮的成功报告。
+            _startupInspection = null;
+            _startupInitializationError = string.Empty;
+
+            State = LauncherState.CheckingInstallation;
+            StatusText = "正在检查安装事务，请稍候……";
+
+            try
+            {
+                _startupInspection = await Task.Run(
+                    () => _transactionStore.InspectExisting(ExpectedGameId));
+
+                if (_startupInspection.RequiresAttention)
+                {
+                    InstallTransactionDiscovery discovery =
+                        _startupInspection.Discovery;
+
+                    State = LauncherState.RecoveryRequired;
+
+                    StatusText =
+                        $"发现待处理安装信息：正式记录 " +
+                        $"{discovery.RecordIds.Count} 份" +
+                        $"（读取失败 {_startupInspection.ReadFailures.Count} 份），" +
+                        $"临时文件 {discovery.TemporaryFileNames.Count} 个，" +
+                        $"异常条目 {discovery.UnexpectedEntryNames.Count} 个。" +
+                        "尚未执行恢复，已暂停游戏启动和更新操作。";
+
+                    return;
+                }
+
+                _startupInspectionPassed = true;
+
+                if (!_hasRestoredGameSelection)
+                {
+                    // 首次检查被阻止时，等某轮检查通过后再恢复选择。
+                    RestoreGameSelection();
+                    _hasRestoredGameSelection = true;
+                }
+                else
+                {
+                    // 保留当前选择和下载结果，不重新加载旧设置。
+                    RefreshLocalVersion();
+                    State = EvaluateIdleState();
+
+                    StatusText = State switch
+                    {
+                        LauncherState.Ready =>
+                            "本轮检查未发现待处理事务，可以继续操作。",
+
+                        LauncherState.GameMissing =>
+                            "本轮检查未发现待处理事务，但游戏路径已失效，请重新选择。",
+
+                        _ =>
+                            "本轮检查未发现待处理事务，请选择游戏程序。"
+                    };
+                }
+            }
+            catch (Exception exception) when (
+                exception is IOException
+                    or InvalidDataException
+                    or JsonException
+                    or UnauthorizedAccessException
+                    or ArgumentException
+                    or NotSupportedException
+                    or System.Security.SecurityException)
+            {
+                _startupInitializationError =
+                    $"{exception.GetType().Name}: {exception.Message}";
+
+                _startupInspectionPassed = false;
+                State = LauncherState.RecoveryRequired;
+
+                StatusText =
+                    $"检查未完成，已暂停游戏启动和更新：{exception.Message}";
+
+                Debug.WriteLine(exception);
+            }
+            catch (Exception exception)
+            {
+                // 未预期错误也必须先关闭权限，再交给窗口处理。
+                _startupInitializationError =
+                    $"{exception.GetType().Name}: {exception.Message}";
+
+                _startupInspectionPassed = false;
+                State = LauncherState.RecoveryRequired;
+                StatusText = "检查发生未预期错误，已停止后续操作。";
+
+                throw;
+            }
+            finally
+            {
+                // 只结束检查占用，不能在 finally 中强行恢复 Ready。
+                _isStartupInspectionRunning = false;
+
+                OnPropertyChanged(nameof(CanRecheckStartupInspection));
+                OnPropertyChanged(nameof(CanViewStartupInspection));
+            }
         }
 
         #endregion
@@ -115,6 +274,11 @@ namespace NiumaLauncher.ViewModel
                 OnPropertyChanged(nameof(LaunchButtonText));
                 OnPropertyChanged(nameof(CanCheckForUpdates));
                 NotifyDownloadUi();
+                NotifyStagingUi();
+                OnPropertyChanged(nameof(IsBuildingInstallPlan));
+                OnPropertyChanged(nameof(CanPreviewInstallPlan));
+                OnPropertyChanged(nameof(CanViewStartupInspection));
+                OnPropertyChanged(nameof(CanRecheckStartupInspection));
             }
         }
 
@@ -129,8 +293,29 @@ namespace NiumaLauncher.ViewModel
         // 本阶段只检查已经选择且路径有效的本地游戏。
         public bool CanCheckForUpdates => State == LauncherState.Ready;
 
+        // 空闲或待处理时允许查看；业务忙碌期间不开放。
+        // 检查结束且存在结果时，才能打开详情。
+        public bool CanViewStartupInspection =>
+            !_isStartupInspectionRunning
+            && (State is LauncherState.Ready
+                or LauncherState.NoGameSelected
+                or LauncherState.GameMissing
+                or LauncherState.RecoveryRequired)
+            && (_startupInspection is not null
+                || !string.IsNullOrWhiteSpace(_startupInitializationError));
+
+        // 只在空闲或待处理状态允许重新检查。
+        public bool CanRecheckStartupInspection =>
+            !_isStartupInspectionRunning
+            && (State is LauncherState.Ready
+                or LauncherState.NoGameSelected
+                or LauncherState.GameMissing
+                or LauncherState.RecoveryRequired);
+
         public string LaunchButtonText => State switch
         {
+            LauncherState.CheckingInstallation => "正在检查安装状态",
+            LauncherState.RecoveryRequired => "安装状态待处理",
             LauncherState.Ready => "开始游戏",
             LauncherState.Starting => "正在启动……",
             LauncherState.Running => "游戏运行中",
@@ -139,6 +324,8 @@ namespace NiumaLauncher.ViewModel
             LauncherState.CheckingUpdates => "正在检查更新",
             LauncherState.DownloadingPackage => "正在下载更新",
             LauncherState.VerifyingPackage => "正在校验更新",
+            LauncherState.PreparingPackage => "正在准备安装",
+            LauncherState.BuildingInstallPlan => "正在生成安装计划",
             _ => "请选择游戏"
         };
 
@@ -186,6 +373,185 @@ namespace NiumaLauncher.ViewModel
         public string DownloadedPackageText => _downloadedPackage is { } package
             ? $"缓存包：{package.Version}（构建 {package.BuildNumber}），尚未安装"
             : "缓存包：当前会话没有已完成的下载";
+
+        public bool IsPreparingPackage => State == LauncherState.PreparingPackage;
+
+        public bool CanPreparePackage =>
+            State == LauncherState.Ready &&
+            _downloadedPackage is not null &&
+            _stagedPackage is null;
+
+        public bool CanUsePrepareButton =>
+            IsPreparingPackage
+                ? _stagingCancellation is { IsCancellationRequested: false }
+                : CanPreparePackage;
+
+        public string PrepareButtonText =>
+            IsPreparingPackage
+                ? _stagingCancellation?.IsCancellationRequested == true
+                    ? "正在取消……"
+                    : "取消准备"
+                : _stagedPackage is not null
+                    ? "已准备"
+                    : "准备安装";
+
+        public string StagedPackageText =>
+            _stagedPackage is { } staged
+                ? $"暂存版本：{staged.SourcePackage.Version}" +
+                  $"（构建 {staged.SourcePackage.BuildNumber}），尚未安装。" +
+                  $"目录：{staged.DirectoryPath}"
+                : "暂存版本：尚未准备";
+
+        public bool IsBuildingInstallPlan => State == LauncherState.BuildingInstallPlan;
+
+        // 本步要求当前会话已经准备完成，且准备的是当前下载包。
+        // 这是流程一致性检查，不是对磁盘文件的再次完整性校验。
+        public bool CanPreviewInstallPlan =>
+            State == LauncherState.Ready &&
+            _stagedPackage is { } staged &&
+            ReferenceEquals(_downloadedPackage, staged.SourcePackage);
+
+        // 没有百分比回调的阶段，统一显示忙碌动画。
+        public bool IsPackageWorkIndeterminate =>
+            State == LauncherState.CheckingInstallation ||
+            IsVerifyingPackage ||
+            IsPreparingPackage ||
+            IsBuildingInstallPlan;
+        #endregion
+
+        #region Startup Inspection Details(启动检查详情)
+
+        // 只限制界面展示，不影响扫描结果和启动门禁。
+        private const int MaxDetailEntriesPerGroup = 50;
+        private const int MaxDetailValueCharacters = 512;
+
+        /// <summary>
+        /// 根据内存中的检查结果生成展示文字，不访问磁盘。
+        /// </summary>
+        public string CreateStartupInspectionDetails()
+        {
+            if (!CanViewStartupInspection)
+            {
+                return string.Empty;
+            }
+
+            var text = new StringBuilder();
+
+            text.AppendLine("这是最近一次检查的快照，不是实时磁盘状态。");
+            text.AppendLine("打开或关闭本窗口不会重新检查、恢复或删除文件。");
+            text.AppendLine($"当前界面状态：{State}");
+
+            if (!string.IsNullOrWhiteSpace(_startupInitializationError))
+            {
+                text.AppendLine(
+                    $"检查错误：{FormatDetailValue(_startupInitializationError)}");
+            }
+
+            if (_startupInspection is not { } report)
+            {
+                text.AppendLine();
+                text.AppendLine("未取得完整事务报告，不能视为没有事务。");
+                return text.ToString();
+            }
+
+            text.AppendLine($"游戏身份：{FormatDetailValue(report.GameId)}");
+            text.AppendLine(
+                report.Discovery.DirectoryExists
+                    ? "发现时事务目录：存在"
+                    : "发现时事务目录：未发现");
+
+            // 局部函数只服务于本次文字生成，复用分组展示规则。
+            void AppendGroup(
+                string title,
+                int total,
+                IEnumerable<string> entries)
+            {
+                text.AppendLine();
+                text.AppendLine($"【{title}】共 {total} 项");
+
+                if (total == 0)
+                {
+                    text.AppendLine("无。");
+                    return;
+                }
+
+                foreach (string entry in entries.Take(MaxDetailEntriesPerGroup))
+                {
+                    text.AppendLine(entry);
+                    text.AppendLine();
+                }
+
+                if (total > MaxDetailEntriesPerGroup)
+                {
+                    text.AppendLine(
+                        $"其余 {total - MaxDetailEntriesPerGroup} 项未展示，" +
+                        "仍保留在检查报告中并参与状态判断。");
+                }
+            }
+
+            AppendGroup(
+                "已读取的正式记录，不代表安装完成",
+                report.LoadedRecords.Count,
+                report.LoadedRecords.Select(record => string.Join(
+                    Environment.NewLine,
+                    new[]
+                    {
+                $"编号：{record.OperationId:N}",
+                $"登记阶段：{record.Phase}",
+                $"原版本：{FormatDetailValue(record.CurrentVersion)}" +
+                $"（构建 {record.CurrentBuildNumber}）",
+                $"目标版本：{FormatDetailValue(record.TargetVersion)}" +
+                $"（构建 {record.TargetBuildNumber}）",
+                $"记录中的程序：{FormatDetailValue(record.GameExecutablePath)}",
+                $"记录中的工作区：{FormatDetailValue(record.WorkspaceDirectoryPath)}"
+                    })));
+
+            AppendGroup(
+                "读取失败的正式记录",
+                report.ReadFailures.Count,
+                report.ReadFailures
+                    .OrderBy(pair => pair.Key)
+                    .Select(pair =>
+                        $"{pair.Key:N}.json{Environment.NewLine}" +
+                        $"原因：{FormatDetailValue(pair.Value)}"));
+
+            AppendGroup(
+                "临时文件",
+                report.Discovery.TemporaryFileNames.Count,
+                report.Discovery.TemporaryFileNames.Select(FormatDetailValue));
+
+            AppendGroup(
+                "异常条目",
+                report.Discovery.UnexpectedEntryNames.Count,
+                report.Discovery.UnexpectedEntryNames.Select(FormatDetailValue));
+
+            text.AppendLine();
+            text.AppendLine("路径来自记录快照，不表示对应目录当前存在或可以修改。");
+            text.AppendLine("请勿通过删除记录来绕过待处理状态。");
+
+            return text.ToString();
+        }
+
+        /// <summary>
+        /// 限制单个字段的展示长度，避免长内容和控制字符挤乱报告。
+        /// 不修改原始数据，也不能把返回值用于实际路径操作。
+        /// </summary>
+        private static string FormatDetailValue(string? value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return "（空）";
+            }
+
+            string preview = new string(
+                value.Take(MaxDetailValueCharacters)
+                    .Select(character => char.IsControl(character) ? ' ' : character)
+                    .ToArray());
+
+            return value.Length > MaxDetailValueCharacters
+                ? preview + "…（已截断）"
+                : preview;
+        }
 
         #endregion
 
@@ -286,12 +652,17 @@ namespace NiumaLauncher.ViewModel
                     StringComparison.OrdinalIgnoreCase);
         }
 
-        /// <summary>
-        /// 仅在没有启动任务占用时，根据游戏路径判断可用状态。
-        /// 不负责判断游戏进程是否正在运行。
-        /// </summary>
         private LauncherState EvaluateIdleState()
         {
+            // 必须先经过启动检查，再根据游戏路径判断空闲状态。
+            // 防止其它流程的 finally 把待处理状态恢复成 Ready。
+            if (!_startupInspectionPassed)
+            {
+                return State == LauncherState.CheckingInstallation
+                    ? LauncherState.CheckingInstallation
+                    : LauncherState.RecoveryRequired;
+            }
+
             if (string.IsNullOrWhiteSpace(GameExecutablePath))
             {
                 return LauncherState.NoGameSelected;
@@ -301,7 +672,6 @@ namespace NiumaLauncher.ViewModel
                 ? LauncherState.Ready
                 : LauncherState.GameMissing;
         }
-
         #endregion
 
         #region Local Version(本地版本信息)
@@ -464,6 +834,11 @@ namespace NiumaLauncher.ViewModel
         private void SetDownloadedPackage(DownloadedGamePackage? package)
         {
             _downloadedPackage = package;
+
+            // 下载结果更换后，旧暂存记录不再代表当前这份包。
+            //这里只清除引用，不擅自删除磁盘目录。
+            SetStagedPackage(null);
+
             OnPropertyChanged(nameof(DownloadedPackageText));
         }
 
@@ -591,6 +966,185 @@ namespace NiumaLauncher.ViewModel
                 // 先让排队中的旧回调失效，再恢复界面操作。
                 _downloadCancellation = null;
 
+                State = EvaluateIdleState();
+                RefreshLocalVersion();
+            }
+        }
+
+        #endregion
+
+        #region Package Staging(发布包暂存)
+
+        private void NotifyStagingUi()
+        {
+            OnPropertyChanged(nameof(IsPreparingPackage));
+            OnPropertyChanged(nameof(CanPreparePackage));
+            OnPropertyChanged(nameof(CanUsePrepareButton));
+            OnPropertyChanged(nameof(PrepareButtonText));
+            OnPropertyChanged(nameof(IsPackageWorkIndeterminate));
+        }
+
+        private void SetStagedPackage(StagedGamePackage? package)
+        {
+            _stagedPackage = package;
+
+            OnPropertyChanged(nameof(StagedPackageText));
+            OnPropertyChanged(nameof(CanPreviewInstallPlan));
+            NotifyStagingUi();
+        }
+
+        public void CancelPreparation()
+        {
+            if (!IsPreparingPackage ||
+                _stagingCancellation is not
+                { IsCancellationRequested: false } cancellation)
+            {
+                return;
+            }
+
+            // 只发送请求，不能立即恢复 Ready。
+            // 服务还需要退出读写并尝试清理本次失败目录。
+            cancellation.Cancel();
+
+            NotifyStagingUi();
+            StatusText = "正在取消准备，等待暂存任务结束……";
+        }
+
+        public async Task PreparePackageAsync()
+        {
+            if (!CanPreparePackage ||
+                _downloadedPackage is not DownloadedGamePackage package)
+            {
+                return;
+            }
+
+            using var cancellation = new CancellationTokenSource();
+
+            _stagingCancellation = cancellation;
+
+            // 在第一次 await 前锁住其它操作，防止重复进入。
+            State = LauncherState.PreparingPackage;
+            StatusText = "正在重新校验缓存包并准备暂存文件……";
+
+            try
+            {
+                string selectedExecutablePath = GameExecutablePath;
+
+                // 下载之后，原游戏文件仍可能被外部程序修改。
+                if (!IsValidGameExecutable(selectedExecutablePath))
+                {
+                    StatusText = "游戏路径已失效，请重新选择游戏。";
+                    return;
+                }
+
+                GameBuildManifest? local = _buildManifestReader.Load(
+                    selectedExecutablePath,
+                    ExpectedGameId);
+
+                if (local == null)
+                {
+                    StatusText = "缺少本地版本清单，无法确认更新目标。";
+                    return;
+                }
+
+                if (package.BuildNumber <= local.BuildNumber)
+                {
+                    StatusText = "缓存包构建号不高于本地版本，请重新检查更新。";
+                    return;
+                }
+
+                // 期望名称来自当前选择，而不是让 ZIP 自己决定启动哪个程序。
+                string expectedExecutableName =
+                    Path.GetFileName(selectedExecutablePath);
+
+                StagedGamePackage staged = await _packageStager.StageAsync(
+                    package,
+                    ExpectedGameId,
+                    expectedExecutableName,
+                    cancellation.Token);
+
+                // 服务成功返回就保留结果。
+                // 不在这里再次检查取消，以免丢失已经成功的目录引用。
+                SetStagedPackage(staged);
+
+                StatusText =
+                    "更新准备完成，尚未安装。原游戏文件和启动路径没有改变。";
+            }
+            catch (OperationCanceledException)
+            {
+                StatusText = cancellation.IsCancellationRequested
+                    ? "准备已取消，下载缓存仍保留，可以重试。"
+                    : "准备过程超时，下载缓存仍保留，可以重试。";
+            }
+            catch (Exception exception) when (
+                exception is IOException or
+                UnauthorizedAccessException or
+                InvalidDataException or
+                JsonException or
+                CryptographicException or
+                NotSupportedException)
+            {
+                StatusText = $"准备失败：{exception.Message}";
+            }
+            finally
+            {
+                // 必须等服务结束后再解除忙碌状态。
+                _stagingCancellation = null;
+
+                State = EvaluateIdleState();
+                RefreshLocalVersion();
+            }
+        }
+
+        #endregion
+
+        #region Install Plan Preview(安装计划预览)
+
+        public async Task<GameInstallPlan?> CreateInstallPlanPreviewAsync()
+        {
+            if (!CanPreviewInstallPlan || _stagedPackage is not StagedGamePackage staged)
+            {
+                return null;
+            }
+
+            // 在 UI 线程捕获本次参数，后台服务不读取界面状态。
+            string selectedExecutablePath = GameExecutablePath;
+            DownloadedGamePackage package = staged.SourcePackage;
+
+            // 第一次 await 之前进入忙碌状态，防止重复操作。
+            State = LauncherState.BuildingInstallPlan;
+            StatusText = "正在检查安装目标并生成只读计划……";
+
+            try
+            {
+                // Build 包含文件读取和目录检查，放到后台执行。
+                // 它只返回计划，不创建或移动游戏目录。
+                GameInstallPlan plan = await Task.Run(
+                    () => _installPlanBuilder.Build(
+                        package,
+                        selectedExecutablePath,
+                        ExpectedGameId));
+
+                StatusText =
+                    "安装计划已生成，仅供预览，尚未创建工作区或安装。";
+
+                return plan;
+            }
+            catch (Exception exception) when (
+                exception is IOException or
+                UnauthorizedAccessException or
+                InvalidDataException or
+                JsonException or
+                ArgumentException or
+                NotSupportedException or
+                System.Security.SecurityException)
+            {
+                StatusText = $"无法生成安装计划：{exception.Message}";
+                return null;
+            }
+            finally
+            {
+                // 只读检查结束后，再恢复按钮状态。
                 State = EvaluateIdleState();
                 RefreshLocalVersion();
             }

@@ -1,6 +1,8 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Threading;
 using NiumaLauncher.Models;
@@ -55,11 +57,6 @@ public sealed class GamePackageStager
         string expectedExecutableName,
         CancellationToken cancellationToken)
     {
-        string archivePath = ValidateRequest(
-            package,
-            expectedGameId,
-            expectedExecutableName);
-
         using var operation =
             CancellationTokenSource.CreateLinkedTokenSource(
                 cancellationToken);
@@ -69,34 +66,14 @@ public sealed class GamePackageStager
 
         token.ThrowIfCancellationRequested();
 
-        // 不开放写入和删除共享。
-        // 校验和解压一直使用这个句柄，不重新按路径打开。
-        await using var archiveStream = new FileStream(
-            archivePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            BufferSize,
-            FileOptions.Asynchronous);
-
-        if (archiveStream.Length != package.SizeBytes)
-        {
-            throw new InvalidDataException("缓存 ZIP 大小已经变化。");
-        }
-
-        byte[] hash = await SHA256.HashDataAsync(
-            archiveStream,
-            token).ConfigureAwait(false);
-
-        if (!string.Equals(
-                Convert.ToHexString(hash),
-                package.Sha256,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidDataException("缓存 ZIP 哈希不匹配。");
-        }
-
-        archiveStream.Position = 0;
+        // 接管已校验文件流的生命周期。
+        // 后面的 ZipArchive 继续使用同一个流，不重新打开缓存路径。
+        await using FileStream archiveStream =
+            await OpenVerifiedArchiveAsync(
+                package,
+                expectedGameId,
+                expectedExecutableName,
+                token).ConfigureAwait(false);
 
         using var archive = new ZipArchive(
             archiveStream,
@@ -151,6 +128,351 @@ public sealed class GamePackageStager
             {
                 TryCleanup(root, parent);
             }
+        }
+    }
+
+    #endregion
+
+    #region Candidate Preparation(候选版本准备)
+
+    /// <summary>
+    /// 在调用方持有的安装会话内准备候选并推进事务阶段。
+    /// 调用方必须等待本方法结束，期间不能释放会话。
+    /// 不切换正式目录，不直接接入 UI。
+    /// </summary>
+    internal static async Task<StagedGamePackage> PrepareCandidateCoreAsync(
+        GameInstallSession session,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        using var operation =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken);
+
+        operation.CancelAfter(OperationTimeout);
+        CancellationToken token = operation.Token;
+
+        token.ThrowIfCancellationRequested();
+
+        // 同一会话只允许一次准备尝试。
+        GameInstallPlan plan = session.ClaimCandidatePreparation();
+        string expectedGameId = session.ExpectedGameId;
+
+        var planBuilder = new GameInstallPlanBuilder();
+
+        GameInstallPlan checkedPlan =
+            planBuilder.RevalidateBeforeWorkspaceCreation(
+                plan,
+                expectedGameId);
+
+        string expectedExecutableName =
+            Path.GetFileName(checkedPlan.GameExecutablePath);
+
+        string candidateRoot = checkedPlan.CandidateDirectoryPath;
+
+        // 校验后继续使用同一个 ZIP 文件流。
+        await using FileStream archiveStream =
+            await OpenVerifiedArchiveAsync(
+                checkedPlan.SourcePackage,
+                expectedGameId,
+                expectedExecutableName,
+                token).ConfigureAwait(false);
+
+        using var archive = new ZipArchive(
+            archiveStream,
+            ZipArchiveMode.Read,
+            leaveOpen: true);
+
+        token.ThrowIfCancellationRequested();
+
+        // 预检不需要工作区，明显坏包先在这里拒绝。
+        List<PlannedEntry> entries = BuildPlan(
+            archive,
+            candidateRoot,
+            expectedExecutableName,
+            token);
+
+        token.ThrowIfCancellationRequested();
+
+        // 哈希与条目预检可能耗时，登记前重新核对。
+        session.VerifyGameDirectoryUnchanged();
+        session.VerifyNoMatchingGameProcess();
+
+        token.ThrowIfCancellationRequested();
+
+        var transactionStore = new GameInstallTransactionStore();
+
+        // 从登记尝试开始，失败就可能留下持久记录或临时记录。
+        try
+        {
+            _ = transactionStore.RegisterForCandidatePreparation(
+                checkedPlan,
+                expectedGameId);
+
+            // 登记成功后才能创建工作区。
+            token.ThrowIfCancellationRequested();
+
+            session.VerifyGameDirectoryUnchanged();
+            session.VerifyNoMatchingGameProcess();
+
+            checkedPlan = CreateWorkspaceForPlan(
+                checkedPlan,
+                expectedGameId,
+                token);
+
+            // 会话持有引用，准备方法返回后仍保留身份基线。
+            // 必须在工作区创建成功后、开始解压前调用。
+            session.CaptureWorkspaceDirectories();
+
+            await ExtractAsync(
+                candidateRoot,
+                entries,
+                token).ConfigureAwait(false);
+
+            token.ThrowIfCancellationRequested();
+
+            session.VerifyWorkspaceDirectoriesUnchanged();
+
+            session.VerifyGameDirectoryUnchanged();
+            session.VerifyNoMatchingGameProcess();
+
+            // 沿用已有 EXE、GameId、版本与构建号检查。
+            string executablePath = ValidateStagedBuild(
+                candidateRoot,
+                checkedPlan.SourcePackage,
+                expectedGameId,
+                expectedExecutableName);
+
+            session.VerifyWorkspaceDirectoriesUnchanged();
+
+            token.ThrowIfCancellationRequested();
+
+            // 先构造结果，再持久发布阶段。
+            var result = new StagedGamePackage(
+                checkedPlan.SourcePackage,
+                candidateRoot,
+                executablePath);
+
+            _ = transactionStore.MarkCandidateReady(
+                checkedPlan,
+                expectedGameId);
+
+            // 阶段已经持久发布，不再因随后到来的取消请求
+            // 主动把本次准备报成未完成。
+            return result;
+        }
+        catch
+        {
+            // 登记、创建或推进阶段失败，都不能猜测磁盘状态。
+            // 保留现场，不调用旧暂存清理器，不自动重试。
+            Debug.WriteLine(
+                "候选准备流程异常，可能遗留事务或工作区，未自动清理：" +
+                $"OperationId={checkedPlan.OperationId:N}, " +
+                $"Workspace={checkedPlan.WorkspaceDirectoryPath}");
+
+            throw;
+        }
+    }
+
+    #endregion
+
+    #region Candidate Revalidation(提交前候选复核)
+
+    /// <summary>
+    /// 在活跃安装会话内重新检查候选构建。
+    /// 不重新解压、不推进事务，也不取得新的安装权限。
+    /// </summary>
+    internal static void RevalidateCandidateBuild(GameInstallSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        var transactionStore = new GameInstallTransactionStore();
+
+        // 先确认本次正式记录存在、匹配，并处于候选就绪阶段。
+        transactionStore.RequireCandidateReady(session);
+
+        session.VerifyGameDirectoryUnchanged();
+        session.VerifyWorkspaceDirectoriesUnchanged();
+
+        var planBuilder = new GameInstallPlanBuilder();
+
+        // 重新检查原构建与准备后的目录布局。
+        GameInstallPlan checkedPlan =
+            planBuilder.RevalidatePreparedLayout(
+                session.Plan,
+                session.ExpectedGameId);
+
+        // 程序名称来自计划，不由候选清单改变启动目标。
+        string expectedExecutableName =
+            Path.GetFileName(checkedPlan.GameExecutablePath);
+
+        _ = ValidateStagedBuild(
+            checkedPlan.CandidateDirectoryPath,
+            checkedPlan.SourcePackage,
+            session.ExpectedGameId,
+            expectedExecutableName);
+
+        // 内容读取结束后，再比较目录实体。
+        session.VerifyWorkspaceDirectoriesUnchanged();
+        session.VerifyGameDirectoryUnchanged();
+
+        // 再次读取，拒绝前后观察到的事务身份或阶段变化。
+        transactionStore.RequireCandidateReady(session);
+    }
+
+    /// <summary>
+    /// 旧目录已备份时，重新检查候选构建。
+    /// 不要求旧游戏仍在正式位置，也不推进事务。
+    /// </summary>
+    internal static void RevalidateCandidateAfterBackup(
+        GameInstallSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        session.VerifyBeforeCandidateMove();
+
+        GameInstallPlan plan = session.Plan;
+
+        // 目标程序名仍来自计划，不接受候选自行改变程序名称。
+        string expectedExecutableName =
+            Path.GetFileName(plan.GameExecutablePath);
+
+        _ = ValidateStagedBuild(
+            plan.CandidateDirectoryPath,
+            plan.SourcePackage,
+            session.ExpectedGameId,
+            expectedExecutableName);
+
+        // 读取清单之后，再观察一次目录身份和空缺位置。
+        session.VerifyBeforeCandidateMove();
+    }
+
+    #endregion
+
+    #region Workspace Preparation(工作区准备)
+
+    /// <summary>
+    /// 复核计划并创建本次工作区及空候选目录。
+    /// 仅供后续受控流程调用，不执行解压或正式目录替换。
+    /// </summary>
+    private static GameInstallPlan CreateWorkspaceForPlan(
+        GameInstallPlan plan,
+        string expectedGameId,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+
+        var planBuilder = new GameInstallPlanBuilder();
+
+        // 沿用原操作编号，重新检查当前版本、路径和工作区冲突。
+        GameInstallPlan checkedPlan =
+            planBuilder.RevalidateBeforeWorkspaceCreation(
+                plan,
+                expectedGameId);
+
+        token.ThrowIfCancellationRequested();
+
+        // 只记录本次创建调用是否成功返回，不代表长期目录所有权。
+        bool workspaceCreated = false;
+
+        try
+        {
+            CreateNewDirectory(checkedPlan.WorkspaceDirectoryPath);
+            workspaceCreated = true;
+
+            EnsurePlainDirectory(checkedPlan.WorkspaceDirectoryPath);
+
+            token.ThrowIfCancellationRequested();
+
+            // candidate 必须是新目录。
+            // backup 和 failed-new 此时不创建。
+            CreateNewDirectory(checkedPlan.CandidateDirectoryPath);
+            EnsurePlainDirectory(checkedPlan.CandidateDirectoryPath);
+
+            token.ThrowIfCancellationRequested();
+
+            // 返回复核后的数据；不代表候选内容已经准备或安装成功。
+            return checkedPlan;
+        }
+        catch
+        {
+            if (workspaceCreated)
+            {
+                // 调用方已经先登记准备意图，清理与恢复执行仍未接入
+                // 保留现场，不把旧暂存清理器用于这里
+                Debug.WriteLine(
+                    "工作区准备未完成，可能留下部分目录，未自动清理：" +
+                    checkedPlan.WorkspaceDirectoryPath);
+            }
+
+            // 保留原异常，包括取消异常，让上层正确处理。
+            throw;
+        }
+    }
+
+    #endregion
+
+    #region Archive Verification(缓存归档校验)
+
+    /// <summary>
+    /// 打开缓存并核对长度、哈希。
+    /// 成功后由调用方负责释放返回的文件流。
+    /// </summary>
+    private static async Task<FileStream> OpenVerifiedArchiveAsync(
+        DownloadedGamePackage package,
+        string expectedGameId,
+        string expectedExecutableName,
+        CancellationToken token)
+    {
+        string archivePath = ValidateRequest(
+            package,
+            expectedGameId,
+            expectedExecutableName);
+
+        token.ThrowIfCancellationRequested();
+
+        // 这里不能使用 using：
+        // 校验成功后，需要把仍打开的流交给调用方继续解压。
+        var stream = new FileStream(
+            archivePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            BufferSize,
+            FileOptions.Asynchronous);
+
+        try
+        {
+            if (stream.Length != package.SizeBytes)
+            {
+                throw new InvalidDataException("缓存 ZIP 大小已经变化。");
+            }
+
+            byte[] hash = await SHA256.HashDataAsync(
+                stream,
+                token).ConfigureAwait(false);
+
+            if (!string.Equals(
+                    Convert.ToHexString(hash),
+                    package.Sha256,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException("缓存 ZIP 哈希不匹配。");
+            }
+
+            // 哈希计算已经读取过文件，交给 ZIP 解析前归零。
+            stream.Position = 0;
+
+            token.ThrowIfCancellationRequested();
+
+            return stream;
+        }
+        catch
+        {
+            // 失败或取消时，流尚未交给调用方，由这里释放。
+            await stream.DisposeAsync().ConfigureAwait(false);
+            throw;
         }
     }
 
@@ -489,6 +811,75 @@ public sealed class GamePackageStager
                 "暂存路径不是普通目录，或包含重解析点。");
         }
     }
+
+    #endregion
+
+    #region Exclusive Directory Creation(新目录排他创建)
+
+    /// <summary>
+    /// 只创建全新目录；目标已存在时失败，不接管已有内容。
+    /// 调用前仍须完成安装计划和完整路径边界检查。
+    /// </summary>
+    private static void CreateNewDirectory(string directoryPath)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new PlatformNotSupportedException(
+                "当前目录创建流程仅支持 Windows。");
+        }
+
+        ArgumentException.ThrowIfNullOrWhiteSpace(directoryPath);
+
+        // 这里只接收普通的完整本地盘符路径。
+        // 这些基础检查不能替代完整安装路径验证。
+        if (!Path.IsPathFullyQualified(directoryPath) ||
+            directoryPath.Length < 3 ||
+            !char.IsAsciiLetter(directoryPath[0]) ||
+            directoryPath[1] != ':' ||
+            directoryPath[2] != '\\')
+        {
+            throw new InvalidDataException(
+                "新目录必须使用完整的本地盘符路径。");
+        }
+
+        string fullPath = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(directoryPath));
+
+        string parent = Path.GetDirectoryName(fullPath)
+            ?? throw new InvalidDataException(
+                "不能把磁盘根目录作为本次新目录。");
+
+        // 父目录必须已经存在，不在这里递归创建整条路径。
+        // 完整父目录链的检查由后续计划复核负责。
+        EnsurePlainDirectory(parent);
+
+        if (CreateDirectoryNative(fullPath, IntPtr.Zero))
+        {
+            return;
+        }
+
+        // 原生调用失败后立即读取错误码。
+        int errorCode = Marshal.GetLastWin32Error();
+        var nativeError = new Win32Exception(errorCode);
+
+        // 已存在、权限不足等情况一律停止。
+        // 不删除冲突目录，也不回退到使用已有目录。
+        throw new IOException(
+            $"无法创建全新目录：{fullPath}。" +
+            $"系统错误 {errorCode}：{nativeError.Message}",
+            nativeError);
+    }
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "CreateDirectoryW",
+        CharSet = CharSet.Unicode,
+        ExactSpelling = true,
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateDirectoryNative(
+        string lpPathName,
+        IntPtr lpSecurityAttributes);
 
     #endregion
 

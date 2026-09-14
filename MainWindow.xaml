@@ -148,6 +148,11 @@
                            Foreground="#8F98A6"
                            Margin="0,0,0,10"/>
 
+                <TextBlock Text="{Binding StagedPackageText}"
+                           TextWrapping="Wrap"
+                           Foreground="#8F98A6"
+                           Margin="0,0,0,10"/>
+
                 <TextBlock Text="{Binding StatusText}"
                            TextWrapping="Wrap"
                            Foreground="#C7F36B"
@@ -158,17 +163,34 @@
                              Minimum="0"
                              Maximum="100"
                              Value="{Binding DownloadProgressPercent, Mode=OneWay}"
-                             IsIndeterminate="{Binding IsVerifyingPackage}"
+                             IsIndeterminate="{Binding IsPackageWorkIndeterminate}"
                              Foreground="#C7F36B"
                              Background="#2C333E"/>
 
-                <StackPanel Orientation="Horizontal"
-                            HorizontalAlignment="Right">
+                <WrapPanel Orientation="Horizontal"
+                           HorizontalAlignment="Right">
+
+                    <Button Content="重新检查安装状态"
+                            Style="{StaticResource LauncherButton}"
+                            Background="#2C333E"
+                            Foreground="#F1F3F5"
+                            Margin="0,0,12,8"
+                            IsEnabled="{Binding CanRecheckStartupInspection}"
+                            Click="RecheckStartupInspectionButton_Click"/>
+
+                    <Button Content="查看启动检查"
+                            Style="{StaticResource LauncherButton}"
+                            Background="#2C333E"
+                            Foreground="#F1F3F5"
+                            Margin="0,0,12,8"
+                            IsEnabled="{Binding CanViewStartupInspection}"
+                            Click="ViewStartupInspectionButton_Click"/>
+
                     <Button Content="选择游戏程序"
                             Style="{StaticResource LauncherButton}"
                             Background="#2C333E"
                             Foreground="#F1F3F5"
-                            Margin="0,0,12,0"
+                            Margin="0,0,12,8"
                             IsEnabled="{Binding CanSelectGame}"
                             Click="SelectGameButton_Click"/>
 
@@ -176,7 +198,7 @@
                             Style="{StaticResource LauncherButton}"
                             Background="#2C333E"
                             Foreground="#F1F3F5"
-                            Margin="0,0,12,0"
+                            Margin="0,0,12,8"
                             IsEnabled="{Binding CanCheckForUpdates}"
                             Click="CheckForUpdatesButton_Click"/>
 
@@ -184,16 +206,34 @@
                             Style="{StaticResource LauncherButton}"
                             Background="#2C333E"
                             Foreground="#F1F3F5"
-                            Margin="0,0,12,0"
+                            Margin="0,0,12,8"
                             IsEnabled="{Binding CanUseDownloadButton}"
                             Click="DownloadPackageButton_Click"/>
+
+                    <Button Content="{Binding PrepareButtonText}"
+                            Style="{StaticResource LauncherButton}"
+                            Background="#2C333E"
+                            Foreground="#F1F3F5"
+                            Margin="0,0,12,8"
+                            IsEnabled="{Binding CanUsePrepareButton}"
+                            Click="PreparePackageButton_Click"/>
+
+                    <Button Content="预览安装计划"
+                            Style="{StaticResource LauncherButton}"
+                            Background="#2C333E"
+                            Foreground="#F1F3F5"
+                            Margin="0,0,12,8"
+                            IsEnabled="{Binding CanPreviewInstallPlan}"
+                            Click="PreviewInstallPlanButton_Click"/>
 
                     <Button Content="{Binding LaunchButtonText}"
                             Style="{StaticResource LauncherButton}"
                             MinWidth="180"
+                            Margin="0,0,0,8"
                             IsEnabled="{Binding CanLaunch}"
                             Click="LaunchGameButton_Click"/>
-                </StackPanel>
+
+                </WrapPanel>
             </StackPanel>
         </Grid>
     </Grid>
