@@ -74,6 +74,95 @@ internal static class GameInstallCoordinator
             cancellationToken);
     }
 
+    /// <summary>
+    /// 在同一段持锁流程中检查恢复历史、保留备份和未完成事务现场。
+    /// 只返回检查结果，不执行恢复，也不改变界面门禁。
+    /// </summary>
+    internal static Task<(
+        InstallTransactionInspection Inspection,
+        string GameExecutablePath,
+        IReadOnlyList<Guid> VerifiedCompletedOperationIds,
+        Guid PendingOperationId,
+        (
+            InstallRecoveryLayout Layout,
+            InstallRecoveryTargetStatus TargetStatus,
+            string TargetDiagnostic,
+            InstallRecoveryRecommendation Recommendation
+        ) PendingBuild)>
+        InspectRecoveryAsync(
+            string expectedGameId,
+            string expectedExecutablePath,
+            CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedGameId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedExecutablePath);
+
+        return Task.Run(
+            () =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                string executablePath =
+                    GameInstallPlanBuilder.NormalizeLocalPath(
+                        expectedExecutablePath);
+
+                // 锁覆盖整轮检查，中途不能释放后再重新取得。
+                using LauncherInstallLock installationLock =
+                    LauncherInstallLock.Acquire();
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var transactionStore = new GameInstallTransactionStore();
+
+                // 不使用界面缓存中的旧报告。
+                InstallTransactionInspection inspection =
+                    transactionStore.InspectExisting(expectedGameId);
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // 拒绝异常日志、历史断档及多笔未完成事务。
+                var history =
+                    GameInstallHistoryAnalyzer.GetRecoveryOperationIds(
+                        inspection,
+                        expectedGameId,
+                        executablePath);
+
+                // 历史完成记录只检查各自保留的工作区和旧备份。
+                // 恢复时不能假设正式目录仍是最后一次完成的版本。
+                foreach (Guid operationId in history.CompletedOperationIds)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    GameCompletedInstallVerifier.VerifyRetainedWorkspace(
+                        operationId,
+                        expectedGameId,
+                        executablePath);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // 唯一未完成事务根据自身布局检查新旧构建，并形成建议。
+                var pendingBuild =
+                    GameInstallRecoveryVerifier.InspectBuildsUnderLock(
+                        history.PendingOperationId,
+                        expectedGameId,
+                        executablePath,
+                        cancellationToken);
+
+                // 本流程没有切换目录，可以响应检查期间收到的取消。
+                cancellationToken.ThrowIfCancellationRequested();
+
+                return (
+                    Inspection: inspection,
+                    GameExecutablePath: executablePath,
+                    VerifiedCompletedOperationIds:
+                        history.CompletedOperationIds,
+                    PendingOperationId: history.PendingOperationId,
+                    PendingBuild: pendingBuild);
+            },
+            cancellationToken);
+    }
+
     #endregion
 
     #region Commit Boundary(提交边界)

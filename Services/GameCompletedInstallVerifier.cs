@@ -32,7 +32,7 @@ internal static class GameCompletedInstallVerifier
                 gameDirectory);
 
         // 正式位置应当是本次更新的目标构建。
-        VerifyBuildAtPath(
+        GameInstallBuildVerifier.VerifyAtPath(
             executablePath,
             expectedGameId,
             record.TargetVersion,
@@ -69,7 +69,7 @@ internal static class GameCompletedInstallVerifier
                 backupPath);
 
         // Current 是安装开始前的原构建，不是现在的正式构建。
-        VerifyBuildAtPath(
+        GameInstallBuildVerifier.VerifyAtPath(
             backupExecutablePath,
             expectedGameId,
             record.CurrentVersion,
@@ -115,7 +115,7 @@ internal static class GameCompletedInstallVerifier
 
         // 分析器负责拒绝未完成记录、异常条目和不连续的历史。
         IReadOnlyList<Guid> operationIds =
-            GameCompletedInstallHistoryAnalyzer.GetOrderedOperationIds(
+           GameInstallHistoryAnalyzer.GetCompletedOperationIds(
                 inspection,
                 expectedGameId,
                 executablePath);
@@ -197,65 +197,7 @@ internal static class GameCompletedInstallVerifier
 
     #endregion
 
-    #region Build Verification(构建内容比较)
-
-    private static void VerifyBuildAtPath(
-        string executablePath,
-        string expectedGameId,
-        string expectedVersion,
-        long expectedBuildNumber,
-        WindowsDirectoryReference directoryReference)
-    {
-        string buildDirectory = Path.GetDirectoryName(executablePath)
-            ?? throw new InvalidDataException("无法确定构建目录。");
-
-        // 引用由外层持有，这里只比较，不重新建立基线或释放引用。
-        directoryReference.RequireSameDirectoryAt(buildDirectory);
-
-        string manifestPath = Path.Combine(
-            buildDirectory,
-            GameBuildManifestReader.ManifestFileName);
-
-        RequireRegularFile(executablePath);
-        RequireRegularFile(manifestPath);
-
-        using var executableStream = new FileStream(
-            executablePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read);
-
-        if (executableStream.Length <= 0)
-        {
-            throw new InvalidDataException("构建中的游戏程序为空。");
-        }
-
-        var manifestReader = new GameBuildManifestReader();
-
-        // 复用已有有界读取和 GameId、EXE 名称等基础校验。
-        GameBuildManifest manifest =
-            manifestReader.Load(executablePath, expectedGameId)
-            ?? throw new InvalidDataException("构建目录缺少版本清单。");
-
-        if (manifest.BuildNumber != expectedBuildNumber ||
-            !string.Equals(
-                manifest.Version,
-                expectedVersion,
-                StringComparison.Ordinal))
-        {
-            throw new InvalidDataException(
-                "构建版本与本次复核的期望版本不一致。");
-        }
-
-        RequireRegularFile(executablePath);
-        RequireRegularFile(manifestPath);
-
-        directoryReference.RequireSameDirectoryAt(buildDirectory);
-    }
-
-    #endregion
-
-    #region Layout and Files(布局与文件检查)
+    #region Workspace Layout(工作区布局)
 
     private static void RequireBackupOnly(string workspacePath)
     {
@@ -297,17 +239,6 @@ internal static class GameCompletedInstallVerifier
         // backup 是否为普通目录，由随后的目录引用检查负责。
     }
 
-    private static void RequireRegularFile(string path)
-    {
-        FileAttributes attributes = File.GetAttributes(path);
-
-        if ((attributes &
-             (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
-        {
-            throw new InvalidDataException(
-                $"要求普通文件，不能是目录或重解析点：{path}");
-        }
-    }
 
     #endregion
 }
