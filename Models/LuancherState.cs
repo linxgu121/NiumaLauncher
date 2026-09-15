@@ -60,5 +60,10 @@ public enum LauncherState
     /// <summary>
     /// 有待处理事务，或无法确认安装状态，暂不开放操作。
     /// </summary>
-    RecoveryRequired
+    RecoveryRequired,
+
+    /// <summary>
+    /// 正在执行安装或安装后的复核，暂不开放其他操作。
+    /// </summary>
+    Installing
 }

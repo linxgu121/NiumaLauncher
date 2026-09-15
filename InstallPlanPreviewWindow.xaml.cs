@@ -41,8 +41,21 @@ public partial class InstallPlanPreviewWindow : Window
                 $"来源 ZIP：{plan.SourcePackage.FilePath}",
 
                 string.Empty,
-                "以上内容只是本次检查得到的计划。",
-                "关闭预览不会安装；正式执行前仍须确认目录用途并重新检查。"
+                "以上内容只是本次检查得到的计划",
+                "当前确认不执行安装；正式执行时仍须重新检查目录和构建"
             });
+    }
+
+    private void ConfirmPlanButton_Click(object sender, RoutedEventArgs e)
+    {
+        // 按钮禁用只是界面提示，事件入口仍检查确认条件。
+        if (DirectoryScopeCheckBox.IsChecked != true)
+        {
+            return;
+        }
+
+        // 只返回用户选择，不在窗口中调用安装服务。
+        // 当前窗口由 ShowDialog 打开，设置结果会关闭对话框。
+        DialogResult = true;
     }
 }

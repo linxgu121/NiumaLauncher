@@ -1,4 +1,5 @@
-﻿using System.Windows;
+﻿using System.ComponentModel;
+using System.Windows;
 using Microsoft.Win32;
 using NiumaLauncher.Models;
 using NiumaLauncher.ViewModel;
@@ -222,7 +223,40 @@ public partial class MainWindow : Window
             Owner = this
         };
 
-        // 每次新建窗口；查看期间限制主窗口交互
-        previewWindow.ShowDialog();
+        // 只有明确返回 true 才表示确认。
+        // 取消、Esc 和关闭窗口都直接结束本次流程。
+        if (previewWindow.ShowDialog() != true)
+        {
+            return;
+        }
+
+        // 当前只完成确认交互，尚未开放真实安装入口。
+        // 不保存长期授权，也不在这里重新生成另一份计划。
+        MessageBox.Show(
+            this,
+            "本次计划已确认，但当前阶段尚未开放真实安装。\n\n" +
+            "没有执行目录切换。以后正式安装时，需要重新生成并确认当次计划。",
+            "计划确认完成",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        base.OnClosing(e);
+
+        if (!_viewModel.IsInstalling)
+        {
+            return;
+        }
+
+        e.Cancel = true;
+
+        MessageBox.Show(
+            this,
+            "安装或安装后的复核尚未结束，请等待结果后再关闭启动器。",
+            "正在安装",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
     }
 }

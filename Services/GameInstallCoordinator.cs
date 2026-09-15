@@ -7,22 +7,24 @@ using NiumaLauncher.Models;
 namespace NiumaLauncher.Services;
 
 /// <summary>
-/// 协调后台安装阶段及会话生命周期。
-/// 后台入口用于候选准备和完成历史复核，尚未开放正式安装
+/// 协调后台安装阶段及会话生命周期
+/// 提供完整安装与完成历史复核入口；实际安装尚未接入界面
 /// </summary>
 internal static class GameInstallCoordinator
 {
     #region Background Entry(后台入口)
 
     /// <summary>
-    /// 成功时返回 Candidate；
-    /// 发现未完成记录等阻塞条目时返回 BlockingInspection
-    /// 其他错误与取消通过异常传播
+    /// 执行完整安装流程；调用方必须先取得用户对安装计划的明确确认。
+    /// 成功时返回 CompletedOperationId；
+    /// 明确阻塞时返回 BlockingInspection；
+    /// 其他错误与取消通过异常传播。
+    /// 当前暂不接入界面。
     /// </summary>
     internal static Task<(
-        StagedGamePackage? Candidate,
+        Guid? CompletedOperationId,
         InstallTransactionInspection? BlockingInspection)>
-        PrepareCandidateOnlyAsync(
+        InstallAsync(
             GameInstallPlan plan,
             string expectedGameId,
             CancellationToken cancellationToken)
@@ -30,10 +32,9 @@ internal static class GameInstallCoordinator
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedGameId);
 
-        // 会话也在后台建立，避免同步检查阻塞界面。
-        // 这里不能提前取得安装锁。
+        // 会话也在后台建立，避免文件检查和安装工作阻塞界面。
         return Task.Run(
-            () => PrepareCandidateOnlyCoreAsync(
+            () => InstallCoreAsync(
                 plan,
                 expectedGameId,
                 cancellationToken),
@@ -222,16 +223,17 @@ internal static class GameInstallCoordinator
     #region Session Lifetime(会话生命周期)
 
     private static async Task<(
-        StagedGamePackage? Candidate,
-        InstallTransactionInspection? BlockingInspection)>
-        PrepareCandidateOnlyCoreAsync(
-            GameInstallPlan plan,
-            string expectedGameId,
-            CancellationToken cancellationToken)
+    Guid? CompletedOperationId,
+    InstallTransactionInspection? BlockingInspection)>
+    InstallCoreAsync(
+        GameInstallPlan plan,
+        string expectedGameId,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        // using 必须覆盖整个候选准备过程。
+        // 同一个会话覆盖准备、目录切换和完成登记。
+        // 方法正常结束或抛出异常后，才释放会话资源。
         using GameInstallSession? session =
             GameInstallSession.BeginIfClear(
                 plan,
@@ -241,23 +243,29 @@ internal static class GameInstallCoordinator
 
         if (session is null)
         {
-            // 未完成记录或异常条目仍然阻止建立安装会话。
-            // 保留完整报告，供调用方说明阻塞原因。
             return (null, inspection);
         }
 
-        // 同步前置检查期间可能收到取消请求。
         cancellationToken.ThrowIfCancellationRequested();
 
-        StagedGamePackage candidate =
-            await GamePackageStager.PrepareCandidateCoreAsync(
-                session,
-                cancellationToken).ConfigureAwait(false);
+        // 等待候选准备结束。
+        // 不把候选路径作为最终结果，因为后面会移动该目录。
+        _ = await GamePackageStager.PrepareCandidateCoreAsync(
+            session,
+            cancellationToken).ConfigureAwait(false);
 
-        // CandidateReady 已经持久发布，
-        // 不再用随后到达的取消请求反转阶段结果。
-        return (candidate, null);
+        // 内部已经包含提交前复核、最后普通取消响应和备份意图登记。
+        // 不要在外层重复调用 RegisterBackupMoveIntent。
+        MoveOldGameToBackup(session, cancellationToken);
+
+        // 进入提交边界后，不在两个目录移动之间追加普通取消检查。
+        MoveCandidateToGame(session);
+
+        // 从正式位置重新验证新版本，然后持久登记 Completed。
+        CompleteInstallation(session);
+
+        // 完成登记后不再用迟到取消反转结果，也不自动清理备份。
+        return (session.Plan.OperationId, null);
     }
-
     #endregion
 }

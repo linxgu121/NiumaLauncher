@@ -8,8 +8,8 @@ using Microsoft.Win32.SafeHandles;
 namespace NiumaLauncher.Services;
 
 /// <summary>
-/// 打开已有普通目录，核对最终路径并读取实体身份
-/// 成功返回的目录引用必须由调用方释放
+/// 验证普通目录身份，并提供允许末级目标缺失的只读观察
+/// OpenVerifiedDirectory 返回的目录引用必须由调用方释放
 /// </summary>
 internal static class WindowsDirectoryPathVerifier
 {
@@ -180,6 +180,84 @@ internal static class WindowsDirectoryPathVerifier
         // 查询结束前再次检查原路径的目录链。
         // 这不是原子检查，也不能保证返回后目录不再变化。
         GameInstallPlanBuilder.EnsureDirectoryChain(normalizedPath);
+    }
+
+    #endregion
+
+    #region Directory Observation(目录存在性观察)
+
+    /// <summary>
+    /// 观察目标目录，直接父目录必须存在且能够验证。
+    /// true：本次观察确认存在普通目录。
+    /// false：本次观察确认末级目标不存在。
+    /// null：无法确认，具体原因通过 diagnostic 返回。
+    /// 本方法不获取安装锁，也不提供恢复操作授权。
+    /// </summary>
+    internal static bool? ObserveDirectory(
+        string directoryPath,
+        out string diagnostic)
+    {
+        diagnostic = string.Empty;
+
+        try
+        {
+            string normalizedPath =
+                GameInstallPlanBuilder.NormalizeLocalPath(directoryPath);
+
+            string parentPath = Path.GetDirectoryName(normalizedPath)
+                ?? throw new InvalidDataException(
+                    "目录观察需要明确的父目录，不能直接观察磁盘根目录。");
+
+            // 先确认父目录可访问，并保留它的实体身份。
+            // 父目录本身消失或无法读取，不能当成目标目录不存在。
+            using WindowsDirectoryReference parentReference =
+                OpenVerifiedDirectory(parentPath);
+
+            FileAttributes attributes;
+
+            try
+            {
+                attributes = File.GetAttributes(normalizedPath);
+            }
+            catch (FileNotFoundException)
+            {
+                // 只有目标属性读取报告缺失，并且父目录仍是原实体，
+                // 才把这次观察记为 false。
+                parentReference.RequireSameDirectoryAt(parentPath);
+                return false;
+            }
+
+            // 路径有条目，但文件占位或重解析点都不属于合格目录。
+            if ((attributes & FileAttributes.Directory) == 0 ||
+                (attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new InvalidDataException(
+                    $"目标必须是普通目录，不能是文件或重解析点：{normalizedPath}");
+            }
+
+            // 属性预检之后，继续通过句柄核对实际路径和实体。
+            using WindowsDirectoryReference directoryReference =
+                OpenVerifiedDirectory(normalizedPath);
+
+            directoryReference.RequireSameDirectoryAt(normalizedPath);
+            parentReference.RequireSameDirectoryAt(parentPath);
+
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or InvalidDataException
+                or UnauthorizedAccessException
+                or ArgumentException
+                or NotSupportedException
+                or System.Security.SecurityException)
+        {
+            // 保留已预期的读取/验证失败，不将其伪装成“不存在”。
+            diagnostic =
+                $"{exception.GetType().Name}: {exception.Message}";
+
+            return null;
+        }
     }
 
     #endregion

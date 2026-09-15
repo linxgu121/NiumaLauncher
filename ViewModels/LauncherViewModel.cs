@@ -353,6 +353,7 @@ namespace NiumaLauncher.ViewModel
                 OnPropertyChanged(nameof(CanPreviewInstallPlan));
                 OnPropertyChanged(nameof(CanViewStartupInspection));
                 OnPropertyChanged(nameof(CanRecheckStartupInspection));
+                OnPropertyChanged(nameof(IsInstalling));
             }
         }
 
@@ -400,6 +401,7 @@ namespace NiumaLauncher.ViewModel
             LauncherState.VerifyingPackage => "正在校验更新",
             LauncherState.PreparingPackage => "正在准备安装",
             LauncherState.BuildingInstallPlan => "正在生成安装计划",
+            LauncherState.Installing => "正在安装更新",
             _ => "请选择游戏"
         };
 
@@ -478,6 +480,8 @@ namespace NiumaLauncher.ViewModel
 
         public bool IsBuildingInstallPlan => State == LauncherState.BuildingInstallPlan;
 
+        public bool IsInstalling => State == LauncherState.Installing;
+
         // 本步要求当前会话已经准备完成，且准备的是当前下载包。
         // 这是流程一致性检查，不是对磁盘文件的再次完整性校验。
         public bool CanPreviewInstallPlan =>
@@ -488,9 +492,11 @@ namespace NiumaLauncher.ViewModel
         // 没有百分比回调的阶段，统一显示忙碌动画。
         public bool IsPackageWorkIndeterminate =>
             State == LauncherState.CheckingInstallation ||
+            IsInstalling ||
             IsVerifyingPackage ||
             IsPreparingPackage ||
             IsBuildingInstallPlan;
+
         #endregion
 
         #region Startup Inspection Details(启动检查详情)
@@ -1184,6 +1190,172 @@ namespace NiumaLauncher.ViewModel
                 State = EvaluateIdleState();
                 RefreshLocalVersion();
             }
+        }
+
+        #endregion
+
+        #region Installation Execution(安装执行与结果处理)
+
+        /// <summary>
+        /// 仅供后续明确确认安装计划的流程调用。
+        /// 当前保持 private，不连接按钮，也不在预览时调用。
+        /// </summary>
+        private async Task ExecuteConfirmedInstallAsync(GameInstallPlan plan)
+        {
+            ArgumentNullException.ThrowIfNull(plan);
+
+            if (!CanPreviewInstallPlan)
+            {
+                return;
+            }
+
+            // 用户确认的计划必须仍然对应当前选择和当前下载包。
+            // 实际路径、版本、进程和历史检查仍由后台负责。
+            if (!ReferenceEquals(_downloadedPackage, plan.SourcePackage) ||
+                !string.Equals(
+                    GameExecutablePath,
+                    plan.GameExecutablePath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                StatusText = "游戏选择或下载包已经变化，请重新生成安装计划。";
+                return;
+            }
+
+            // 首次 await 之前关闭操作权限，不沿用之前的检查结果。
+            _startupInspectionPassed = false;
+            _startupInspection = null;
+            _startupInitializationError = string.Empty;
+
+            State = LauncherState.Installing;
+            StatusText = "正在执行安装，请勿关闭启动器……";
+
+            try
+            {
+                // 清除旧版本的内存引用，不删除磁盘文件。
+                // plan 仍持有本次安装所需的来源信息。
+                SetAvailableRelease(null);
+                SetDownloadedPackage(null);
+                DownloadProgressPercent = 0;
+                LocalVersionText = "本地版本：安装状态待复核";
+
+                var result = await GameInstallCoordinator.InstallAsync(
+                    plan,
+                    ExpectedGameId,
+                    CancellationToken.None);
+
+                if (result.BlockingInspection is { } blockingInspection)
+                {
+                    // 阻塞结果不能同时声称安装完成。
+                    if (result.CompletedOperationId is not null ||
+                        !string.Equals(
+                            blockingInspection.GameId,
+                            ExpectedGameId,
+                            StringComparison.Ordinal) ||
+                        !blockingInspection.RequiresAttention)
+                    {
+                        throw new InvalidDataException(
+                            "安装协调器返回了不一致的阻塞结果。");
+                    }
+
+                    RequireInstallReview(
+                        plan,
+                        "发现待处理安装信息，本次未开始安装。",
+                        blockingInspection);
+
+                    return;
+                }
+
+                // 完成编号必须属于当前这一次计划。
+                if (result.CompletedOperationId is not Guid completedId ||
+                    completedId == Guid.Empty ||
+                    completedId != plan.OperationId)
+                {
+                    throw new InvalidDataException(
+                        "安装协调器返回的完成编号与本次计划不一致。");
+                }
+
+                StatusText = "安装阶段已结束，正在复核完成记录与当前构建……";
+
+                // InstallAsync 已结束并释放会话，现在重新持锁复核。
+                var verification =
+                    await GameInstallCoordinator.VerifyCompletedHistoryAsync(
+                        ExpectedGameId,
+                        plan.GameExecutablePath,
+                        CancellationToken.None);
+
+                // 空历史不能算作“本次安装已经验证成功”。
+                if (!verification.VerifiedOperationIds.Contains(completedId) ||
+                    !string.Equals(
+                        verification.GameExecutablePath,
+                        GameExecutablePath,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        "安装后复核结果不包含本次操作，或不属于当前游戏路径。");
+                }
+
+                _startupInspection = verification.Inspection;
+                _startupInitializationError = string.Empty;
+
+                RefreshLocalVersion();
+
+                // 本次编号和物理复核都通过后，才恢复操作权限。
+                _startupInspectionPassed = true;
+                State = EvaluateIdleState();
+
+                StatusText = State == LauncherState.Ready
+                    ? "安装已完成，安装后复核通过，可以启动游戏。"
+                    : "完成记录已复核，但游戏路径已失效，请重新检查。";
+            }
+            catch (Exception exception) when (
+                exception is IOException
+                    or InvalidDataException
+                    or JsonException
+                    or UnauthorizedAccessException
+                    or ArgumentException
+                    or NotSupportedException
+                    or InvalidOperationException
+                    or OperationCanceledException
+                    or System.Security.SecurityException)
+            {
+                Debug.WriteLine(exception);
+
+                RequireInstallReview(
+                    plan,
+                    $"{exception.GetType().Name}: {exception.Message}");
+            }
+            catch (Exception exception)
+            {
+                // 未预期错误也必须先关闭权限，再交给调用方处理。
+                RequireInstallReview(
+                    plan,
+                    $"{exception.GetType().Name}: {exception.Message}");
+
+                throw;
+            }
+
+            // 不在 finally 中恢复 Ready。
+            // 失败或取消都可能已经留下事务、候选或备份。
+        }
+
+        private void RequireInstallReview(
+            GameInstallPlan plan,
+            string reason,
+            InstallTransactionInspection? inspection = null)
+        {
+            _startupInspectionPassed = false;
+            _startupInspection = inspection;
+
+            // 保存操作编号，方便把界面错误与持久记录对应起来。
+            _startupInitializationError =
+                $"安装操作 {plan.OperationId:N}：{reason}";
+
+            LocalVersionText = "本地版本：安装状态待复核";
+            State = LauncherState.RecoveryRequired;
+
+            StatusText =
+                "安装尚未获得整体确认，已暂停游戏启动和更新。" +
+                "请重新检查，或查看安装检查详情。";
         }
 
         #endregion
