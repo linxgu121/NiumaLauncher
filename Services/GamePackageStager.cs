@@ -348,6 +348,33 @@ public sealed class GamePackageStager
         session.VerifyBeforeCandidateMove();
     }
 
+    /// <summary>
+    /// 候选落位后，从正式位置重新验证新构建。
+    /// 只验证，不登记完成，也不启动游戏。
+    /// </summary>
+    internal static void RevalidateInstalledBuild(
+        GameInstallSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        session.VerifyAfterCandidateMove();
+
+        GameInstallPlan plan = session.Plan;
+
+        string expectedExecutableName =
+            Path.GetFileName(plan.GameExecutablePath);
+
+        // 关键：这里读取正式目录，不再读取 candidate。
+        _ = ValidateStagedBuild(
+            plan.GameDirectoryPath,
+            plan.SourcePackage,
+            session.ExpectedGameId,
+            expectedExecutableName);
+
+        // 内容读取结束后，再核对落位后的身份和布局。
+        session.VerifyAfterCandidateMove();
+    }
+
     #endregion
 
     #region Workspace Preparation(工作区准备)

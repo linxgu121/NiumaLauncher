@@ -59,16 +59,20 @@ internal sealed class GameInstallSession : IDisposable
     #region Opening(建立持锁会话)
 
     /// <summary>
-    /// 有待处理事务时返回 null，并保留检查报告。
-    /// 检查或身份核对失败时抛出异常。
+    /// 存在未完成记录或异常条目时返回 null，并保留检查报告。
+    /// 完成历史必须在本会话持锁期间重新复核。
+    /// 复核、计划检查或身份核对失败时抛出异常。
     /// </summary>
     public static GameInstallSession? BeginIfClear(
         GameInstallPlan plan,
         string expectedGameId,
+        CancellationToken cancellationToken,
         out InstallTransactionInspection inspection)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedGameId);
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         LauncherInstallLock? installationLock =
             LauncherInstallLock.Acquire();
@@ -77,15 +81,34 @@ internal sealed class GameInstallSession : IDisposable
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var transactionStore = new GameInstallTransactionStore();
 
             inspection = transactionStore.InspectExisting(
                 expectedGameId);
 
-            if (inspection.RequiresAttention)
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Completed 本身不是阻塞原因。
+            // 未完成、读取失败、临时文件和异常条目仍然必须阻止。
+            if (inspection.IncompleteRecords.Count > 0 ||
+                inspection.ReadFailures.Count > 0 ||
+                inspection.Discovery.TemporaryFileNames.Count > 0 ||
+                inspection.Discovery.UnexpectedEntryNames.Count > 0)
             {
                 return null;
             }
+
+            // 已经持有安装锁，直接调用同步核心。
+            // 不能调用会再次获取同一把锁的异步入口。
+            var history =
+                GameCompletedInstallVerifier.VerifyHistoryUnderLock(
+                    expectedGameId,
+                    plan.GameExecutablePath,
+                    cancellationToken);
+
+            inspection = history.Inspection;
 
             var planBuilder = new GameInstallPlanBuilder();
 
@@ -94,23 +117,49 @@ internal sealed class GameInstallSession : IDisposable
                     plan,
                     expectedGameId);
 
+            if (history.VerifiedOperationIds.Count > 0)
+            {
+                Guid latestOperationId =
+                    history.VerifiedOperationIds[
+                        history.VerifiedOperationIds.Count - 1];
+
+                // 顺序来自历史分析器，不使用文件枚举顺序。
+                GameInstallTransaction latestRecord =
+                    inspection.CompletedRecords.Single(
+                        record => record.OperationId == latestOperationId);
+
+                // 新计划必须从上一轮已经完成的目标构建开始。
+                if (checkedPlan.CurrentBuildNumber !=
+                        latestRecord.TargetBuildNumber ||
+                    !string.Equals(
+                        checkedPlan.CurrentVersion,
+                        latestRecord.TargetVersion,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException(
+                        "新安装计划的原版本与完成历史末端不一致，" +
+                        "请重新检查并预览安装计划。");
+                }
+            }
+
             gameDirectoryReference =
                 WindowsDirectoryPathVerifier.OpenVerifiedDirectory(
                     checkedPlan.GameDirectoryPath);
 
-            // 保留原对象引用后，再复核计划和当前位置。
-            // 仍沿用同一个 OperationId，不创建新计划编号。
+            // 捕获原目录引用后，再检查计划和当前位置。
+            // 保留原 OperationId，不重新生成计划编号。
             checkedPlan =
                 planBuilder.RevalidateBeforeWorkspaceCreation(
                     checkedPlan,
                     expectedGameId);
 
-            gameDirectoryReference.RequireSameDirectoryAt(
-                checkedPlan.GameDirectoryPath);
+            gameDirectoryReference.RequireSameDirectoryAt(checkedPlan.GameDirectoryPath);
 
-            // 持锁期间重新观察进程，不使用界面缓存的 Running 状态。
-            GameProcessGate.RequireNoMatchingProcess(
-                checkedPlan.GameExecutablePath);
+            // 重新观察实际进程，不使用界面缓存中的运行状态。
+            GameProcessGate.RequireNoMatchingProcess(checkedPlan.GameExecutablePath);
+
+            // 尚未登记事务或移动目录，交接前仍然可以响应取消。
+            cancellationToken.ThrowIfCancellationRequested();
 
             var session = new GameInstallSession(
                 installationLock,
@@ -118,7 +167,7 @@ internal sealed class GameInstallSession : IDisposable
                 checkedPlan,
                 expectedGameId);
 
-            // 成功交接：两个资源现在都由会话负责释放。
+            // 成功交接后，两个资源统一由会话负责释放。
             gameDirectoryReference = null;
             installationLock = null;
 
@@ -132,7 +181,7 @@ internal sealed class GameInstallSession : IDisposable
             }
             finally
             {
-                // 即使前一个资源释放异常，也必须尝试释放锁。
+                // 即使目录引用释放失败，也要尝试释放安装锁。
                 installationLock?.Dispose();
             }
         }

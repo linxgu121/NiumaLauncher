@@ -79,7 +79,7 @@ public partial class MainWindow : Window
         detailsWindow.ShowDialog();
     }
 
-    private async void RecheckStartupInspectionButton_Click(object sender,RoutedEventArgs e)
+    private async void RecheckStartupInspectionButton_Click(object sender, RoutedEventArgs e)
     {
         if (!IsLoaded)
         {
@@ -113,10 +113,15 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SelectGameButton_Click(
+    private async void SelectGameButton_Click(
         object sender,
         RoutedEventArgs e)
     {
+        if (!IsLoaded || !_viewModel.CanSelectGame)
+        {
+            return;
+        }
+
         var dialog = new OpenFileDialog
         {
             Title = "选择 Unity 打包后的游戏程序",
@@ -125,10 +130,36 @@ public partial class MainWindow : Window
             Multiselect = false
         };
 
-        // 传入 this，让文件选择窗口归属于当前主窗口。
-        if (dialog.ShowDialog(this) == true)
+        if (dialog.ShowDialog(this) != true)
         {
-            _viewModel.SelectGame(dialog.FileName);
+            return;
+        }
+
+        try
+        {
+            // ViewModel 会先检查，再决定是否应用和保存新路径。
+            await _viewModel.SelectGameAsync(dialog.FileName);
+        }
+        catch (Exception exception)
+        {
+            // 普通检查失败已经转为待处理状态；
+            // 到这里的是继续传播的未预期错误。
+            System.Diagnostics.Debug.WriteLine(exception);
+
+            if (!IsLoaded)
+            {
+                return;
+            }
+
+            MessageBox.Show(
+                this,
+                "选择游戏时发生未预期错误，启动器将关闭。\n\n" +
+                $"{exception.GetType().Name}: {exception.Message}",
+                "安装检查异常",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+
+            Close();
         }
     }
 

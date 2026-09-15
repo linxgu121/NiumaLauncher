@@ -105,70 +105,143 @@ namespace NiumaLauncher.ViewModel
         }
 
         /// <summary>
-        /// 首次启动和主动重新检查共用的检查流程。
-        /// 后台只读取事务，界面状态仍在 UI 线程更新。
+        /// 首次启动、重新检查和重新选择游戏共用的检查流程。
+        /// 后台复核通过之前，不应用候选路径，也不恢复操作权限。
         /// </summary>
-        private async Task RunStartupInspectionAsync()
+        private async Task RunStartupInspectionAsync(
+            string? requestedExecutablePath = null)
         {
+            if (_isStartupInspectionRunning)
+            {
+                return;
+            }
+
             // 必须在第一次 await 前关闭操作权限。
             _isStartupInspectionRunning = true;
             _startupInspectionPassed = false;
 
-            // 本轮失败时，不能继续展示上一轮的成功报告。
+            // 不沿用上一轮的报告或错误。
             _startupInspection = null;
             _startupInitializationError = string.Empty;
 
             State = LauncherState.CheckingInstallation;
-            StatusText = "正在检查安装事务，请稍候……";
+            StatusText = "正在检查安装状态，请稍候……";
 
             try
             {
-                _startupInspection = await Task.Run(
-                    () => _transactionStore.InspectExisting(ExpectedGameId));
+                // 用户刚选中的路径优先；普通重新检查使用当前会话的选择。
+                string expectedExecutablePath =
+                    requestedExecutablePath ?? GameExecutablePath;
 
-                if (_startupInspection.RequiresAttention)
+                if (requestedExecutablePath is null &&
+                    !_hasRestoredGameSelection)
                 {
-                    InstallTransactionDiscovery discovery =
-                        _startupInspection.Discovery;
+                    // 首次只读取路径字符串，不在这里恢复 Ready。
+                    LauncherSettings settings =
+                        await Task.Run(() => _settingsStore.Load());
 
-                    State = LauncherState.RecoveryRequired;
-
-                    StatusText =
-                        $"发现待处理安装信息：正式记录 " +
-                        $"{discovery.RecordIds.Count} 份" +
-                        $"（读取失败 {_startupInspection.ReadFailures.Count} 份），" +
-                        $"临时文件 {discovery.TemporaryFileNames.Count} 个，" +
-                        $"异常条目 {discovery.UnexpectedEntryNames.Count} 个。" +
-                        "尚未执行恢复，已暂停游戏启动和更新操作。";
-
-                    return;
+                    expectedExecutablePath =
+                        settings.GameExecutablePath ?? string.Empty;
                 }
 
-                _startupInspectionPassed = true;
+                int verifiedHistoryCount = 0;
 
-                if (!_hasRestoredGameSelection)
+                if (string.IsNullOrWhiteSpace(expectedExecutablePath))
                 {
-                    // 首次检查被阻止时，等某轮检查通过后再恢复选择。
-                    RestoreGameSelection();
+                    expectedExecutablePath = string.Empty;
+
+                    // 没有独立期望路径，不能从事务记录反推出游戏位置。
+                    // 此时只检查事务；读取过程同样持有安装锁。
+                    _startupInspection = await Task.Run(() =>
+                    {
+                        using LauncherInstallLock installationLock =
+                            LauncherInstallLock.Acquire();
+
+                        return _transactionStore.InspectExisting(
+                            ExpectedGameId);
+                    });
+
+                    if (_startupInspection.RequiresAttention)
+                    {
+                        State = LauncherState.RecoveryRequired;
+
+                        StatusText =
+                            "尚未选择游戏，但发现待处理安装信息。" +
+                            "无法确定独立的期望路径，已暂停启动和更新，" +
+                            "请查看安装检查详情。";
+
+                        return;
+                    }
+                }
+                else
+                {
+                    // 只有完整复核正常返回，才接收本轮结果。
+                    var result =
+                        await GameInstallCoordinator.VerifyCompletedHistoryAsync(
+                            ExpectedGameId,
+                            expectedExecutablePath,
+                            CancellationToken.None);
+
+                    _startupInspection = result.Inspection;
+                    expectedExecutablePath = result.GameExecutablePath;
+                    verifiedHistoryCount = result.VerifiedOperationIds.Count;
+                }
+
+                if (requestedExecutablePath is not null ||
+                    !_hasRestoredGameSelection)
+                {
+                    // 首次恢复或主动切换：通过检查后才应用路径。
+                    ApplyGameExecutablePath(expectedExecutablePath);
                     _hasRestoredGameSelection = true;
                 }
                 else
                 {
-                    // 保留当前选择和下载结果，不重新加载旧设置。
+                    // 普通重新检查不清空当前下载结果，也不恢复旧设置。
                     RefreshLocalVersion();
-                    State = EvaluateIdleState();
+                }
 
-                    StatusText = State switch
+                _startupInspectionPassed = true;
+
+                // 事务检查通过，不等于一定选了游戏或路径仍然存在。
+                State = EvaluateIdleState();
+
+                string inspectionSummary = verifiedHistoryCount > 0
+                    ? $"本轮已完成 {verifiedHistoryCount} 份历史记录及对应构建复核。"
+                    : "本轮未发现待处理安装事务。";
+
+                StatusText = State switch
+                {
+                    LauncherState.Ready =>
+                        inspectionSummary + "可以继续操作。",
+
+                    LauncherState.GameMissing =>
+                        inspectionSummary +
+                        "但游戏路径已失效，请重新选择。",
+
+                    _ =>
+                        inspectionSummary + "请选择游戏程序。"
+                };
+
+                if (requestedExecutablePath is not null)
+                {
+                    try
                     {
-                        LauncherState.Ready =>
-                            "本轮检查未发现待处理事务，可以继续操作。",
+                        // 新选择通过复核并应用后，才写入持久设置。
+                        _settingsStore.Save(new LauncherSettings
+                        {
+                            GameExecutablePath = expectedExecutablePath
+                        });
 
-                        LauncherState.GameMissing =>
-                            "本轮检查未发现待处理事务，但游戏路径已失效，请重新选择。",
-
-                        _ =>
-                            "本轮检查未发现待处理事务，请选择游戏程序。"
-                    };
+                        StatusText += " 已保存游戏路径。";
+                    }
+                    catch (Exception exception) when (
+                        exception is IOException or UnauthorizedAccessException)
+                    {
+                        // 保存失败与复核失败分开，不宣称新路径已经持久化。
+                        StatusText +=
+                            $" 但保存游戏路径失败，下次启动可能仍使用旧设置：" +
+                            exception.Message;
+                    }
                 }
             }
             catch (Exception exception) when (
@@ -178,6 +251,7 @@ namespace NiumaLauncher.ViewModel
                     or UnauthorizedAccessException
                     or ArgumentException
                     or NotSupportedException
+                    or OperationCanceledException
                     or System.Security.SecurityException)
             {
                 _startupInitializationError =
@@ -489,22 +563,35 @@ namespace NiumaLauncher.ViewModel
                 }
             }
 
-            AppendGroup(
-                "已读取的正式记录，不代表安装完成",
-                report.LoadedRecords.Count,
-                report.LoadedRecords.Select(record => string.Join(
+            // 两个分组使用同一种记录格式，避免字段展示不一致。
+            string FormatTransaction(GameInstallTransaction record)
+            {
+                return string.Join(
                     Environment.NewLine,
                     new[]
                     {
-                $"编号：{record.OperationId:N}",
-                $"登记阶段：{record.Phase}",
-                $"原版本：{FormatDetailValue(record.CurrentVersion)}" +
-                $"（构建 {record.CurrentBuildNumber}）",
-                $"目标版本：{FormatDetailValue(record.TargetVersion)}" +
-                $"（构建 {record.TargetBuildNumber}）",
-                $"记录中的程序：{FormatDetailValue(record.GameExecutablePath)}",
-                $"记录中的工作区：{FormatDetailValue(record.WorkspaceDirectoryPath)}"
-                    })));
+                        $"编号：{record.OperationId:N}",
+                        $"登记阶段：{record.Phase}",
+                        $"原版本：{FormatDetailValue(record.CurrentVersion)}" +
+                        $"（构建 {record.CurrentBuildNumber}）",
+                        $"目标版本：{FormatDetailValue(record.TargetVersion)}" +
+                        $"（构建 {record.TargetBuildNumber}）",
+                        $"记录中的程序：{FormatDetailValue(record.GameExecutablePath)}",
+                        $"记录中的工作区：{FormatDetailValue(record.WorkspaceDirectoryPath)}"
+                    });
+            }
+
+            AppendGroup(
+                _startupInspectionPassed && report.CompletedRecords.Count > 0
+                ? "已登记完成，本轮历史与构建复核通过"
+                : "已登记完成，尚未取得整体复核通过结果",
+                report.CompletedRecords.Count,
+                report.CompletedRecords.Select(FormatTransaction));
+
+            AppendGroup(
+                "尚未登记完成，需核对现场",
+                report.IncompleteRecords.Count,
+                report.IncompleteRecords.Select(FormatTransaction));
 
             AppendGroup(
                 "读取失败的正式记录",
@@ -557,73 +644,22 @@ namespace NiumaLauncher.ViewModel
 
         #region Game Selection(游戏选择模块)
 
-        public void SelectGame(string executablePath)
+        public Task SelectGameAsync(string executablePath)
         {
             if (!CanSelectGame)
             {
-                return;
+                return Task.CompletedTask;
             }
 
             if (!IsValidGameExecutable(executablePath))
             {
                 StatusText = "请选择存在的游戏 .exe 文件。";
-                return;
+                return Task.CompletedTask;
             }
 
-            ApplyGameExecutablePath(executablePath);
-
-            State = LauncherState.Ready;
-
-            try
-            {
-                _settingsStore.Save(new LauncherSettings
-                {
-                    GameExecutablePath = executablePath
-                });
-
-                StatusText = "已选择并保存游戏路径，可以启动。";
-            }
-            catch (Exception exception) when (
-                exception is IOException or UnauthorizedAccessException)
-            {
-                // 保存失败不影响本次使用已经选择的游戏。
-                StatusText = $"本次可以启动，但路径保存失败：{exception.Message}";
-            }
-        }
-
-        private void RestoreGameSelection()
-        {
-            try
-            {
-                LauncherSettings settings = _settingsStore.Load();
-
-                // 保留失效路径，方便用户知道上次选择了哪个游戏。
-                ApplyGameExecutablePath(
-                    settings.GameExecutablePath ?? string.Empty);
-
-                State = EvaluateIdleState();
-
-                StatusText = State switch
-                {
-                    LauncherState.Ready =>
-                        "已恢复上次选择的游戏，可以启动。",
-
-                    LauncherState.GameMissing =>
-                        $"上次的游戏路径不可用，请重新选择：{GameExecutablePath}",
-
-                    _ => "请选择已经打包完成的游戏程序"
-                };
-            }
-            catch (Exception exception) when (
-                exception is IOException or
-                UnauthorizedAccessException or
-                JsonException)
-            {
-                ApplyGameExecutablePath(string.Empty);
-                State = LauncherState.NoGameSelected;
-
-                StatusText = $"读取设置失败，请重新选择游戏：{exception.Message}";
-            }
+            // 新路径先作为候选参与检查，通过后才能应用和保存。
+            // 不能直接沿用上一个游戏路径的检查结果。
+            return RunStartupInspectionAsync(executablePath);
         }
 
         private void ApplyGameExecutablePath(string executablePath)

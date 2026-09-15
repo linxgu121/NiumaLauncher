@@ -8,7 +8,7 @@ namespace NiumaLauncher.Services;
 
 /// <summary>
 /// 协调后台安装阶段及会话生命周期。
-/// 当前仅准备候选，不切换正式游戏目录。
+/// 后台入口用于候选准备和完成历史复核，尚未开放正式安装
 /// </summary>
 internal static class GameInstallCoordinator
 {
@@ -16,8 +16,8 @@ internal static class GameInstallCoordinator
 
     /// <summary>
     /// 成功时返回 Candidate；
-    /// 发现旧事务时返回 BlockingInspection。
-    /// 其他错误与取消通过异常传播。
+    /// 发现未完成记录等阻塞条目时返回 BlockingInspection
+    /// 其他错误与取消通过异常传播
     /// </summary>
     internal static Task<(
         StagedGamePackage? Candidate,
@@ -37,6 +37,39 @@ internal static class GameInstallCoordinator
                 plan,
                 expectedGameId,
                 cancellationToken),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 在后台持续持有同一把安装锁，完成历史及构建复核。
+    /// 错误或取消通过异常传播，不返回部分成功结果。
+    /// </summary>
+    internal static Task<(
+        InstallTransactionInspection Inspection,
+        string GameExecutablePath,
+        IReadOnlyList<Guid> VerifiedOperationIds)>
+        VerifyCompletedHistoryAsync(
+            string expectedGameId,
+            string expectedExecutablePath,
+            CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedGameId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedExecutablePath);
+
+        return Task.Run(
+            () =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // 锁在后台取得，作用域覆盖完整检查过程。
+                using LauncherInstallLock installationLock =
+                    LauncherInstallLock.Acquire();
+
+                return GameCompletedInstallVerifier.VerifyHistoryUnderLock(
+                    expectedGameId,
+                    expectedExecutablePath,
+                    cancellationToken);
+            },
             cancellationToken);
     }
 
@@ -162,6 +195,28 @@ internal static class GameInstallCoordinator
         session.VerifyAfterCandidateMove();
     }
 
+    /// <summary>
+    /// 候选落位后执行最终复验，并持久登记完成。
+    /// 必须继续使用同一个安装会话，不在这里释放资源。
+    /// </summary>
+    private static void CompleteInstallation(GameInstallSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        GameInstallPlan plan = session.Plan;
+
+        // 验证失败会抛异常，不会继续登记 Completed。
+        GamePackageStager.RevalidateInstalledBuild(session);
+
+        var transactionStore = new GameInstallTransactionStore();
+
+        _ = transactionStore.MarkCompleted(
+            plan,
+            session.ExpectedGameId);
+
+        // 已发布完成阶段，不追加取消检查，也不自动删除备份。
+    }
+
     #endregion
 
     #region Session Lifetime(会话生命周期)
@@ -181,11 +236,13 @@ internal static class GameInstallCoordinator
             GameInstallSession.BeginIfClear(
                 plan,
                 expectedGameId,
+                cancellationToken,
                 out InstallTransactionInspection inspection);
 
         if (session is null)
         {
-            // 保留完整报告，不把旧事务直接当普通失败处理。
+            // 未完成记录或异常条目仍然阻止建立安装会话。
+            // 保留完整报告，供调用方说明阻塞原因。
             return (null, inspection);
         }
 

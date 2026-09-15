@@ -21,5 +21,9 @@ public enum InstallTransactionPhase
 
     // 已登记将候选目录移入正式游戏位置的意图。
     // 不代表候选已落位；中断后仍需检查实际目录布局。
-    CandidateMovePending = 40
+    CandidateMovePending = 40,
+
+    // 新版本落位后的检查已通过，并已登记完成。
+    // 不代表游戏运行验证通过，也不自动清理备份。
+    Completed = 50
 }

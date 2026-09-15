@@ -10,6 +10,9 @@ public class GameBuildManifestReader
 
     public const string ManifestFileName = "game-build.json";
 
+    // 限制的是构建清单，不是游戏 EXE 或资源包。
+    private const int MaxManifestBytes = 64 * 1024;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
@@ -19,9 +22,7 @@ public class GameBuildManifestReader
 
     #region Reading(读取)
 
-    public GameBuildManifest? Load(
-        string executablePath,
-        string expectedGameId)
+    public GameBuildManifest? Load(string executablePath, string expectedGameId)
     {
         if (!Path.IsPathFullyQualified(executablePath))
         {
@@ -39,11 +40,44 @@ public class GameBuildManifestReader
 
         try
         {
-            json = File.ReadAllText(manifestPath);
+            // 长度检查和实际读取使用同一个文件句柄。
+            using var stream = new FileStream(
+                manifestPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read);
+
+            long length = stream.Length;
+
+            if (length <= 0 || length > MaxManifestBytes)
+            {
+                throw new InvalidDataException(
+                    $"版本清单必须为 1—{MaxManifestBytes} 字节。");
+            }
+
+            byte[] bytes = new byte[(int)length];
+
+            // 如果内容不足，直接抛异常，不接受截断的清单。
+            stream.ReadExactly(bytes);
+
+            if (stream.ReadByte() != -1 || stream.Length != length)
+            {
+                throw new InvalidDataException(
+                    "版本清单在读取过程中发生长度变化。");
+            }
+
+            // 后续只解析已经限长的内存，不重新打开文件。
+            using var memory = new MemoryStream(bytes, writable: false);
+
+            using var textReader = new StreamReader(
+                memory,
+                detectEncodingFromByteOrderMarks: true);
+
+            json = textReader.ReadToEnd();
         }
         catch (FileNotFoundException)
         {
-            // 缺少清单表示没有版本信息，不能擅自当作 1.0.0。
+            // 仅缺少清单返回 null；其它错误继续向上传递。
             return null;
         }
 
@@ -57,7 +91,6 @@ public class GameBuildManifestReader
 
         return manifest;
     }
-
     #endregion
 
     #region Validation(内容检查)

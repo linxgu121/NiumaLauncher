@@ -253,6 +253,22 @@ public sealed class GameInstallTransactionStore
     }
 
     /// <summary>
+    /// 候选落位意图 → 安装事务完成。
+    /// 调用方必须在同一个持锁会话中完成落位及最终复验。
+    /// 本方法只更新记录，不启动游戏或清理备份。
+    /// </summary>
+    internal GameInstallTransaction MarkCompleted(
+        GameInstallPlan plan,
+        string expectedGameId)
+    {
+        return AdvancePhase(
+            plan,
+            expectedGameId,
+            InstallTransactionPhase.CandidateMovePending,
+            InstallTransactionPhase.Completed);
+    }
+
+    /// <summary>
     /// 共用的持久更新实现。
     /// 保持 private，不向其他类开放任意阶段跳转。
     /// </summary>
@@ -791,7 +807,8 @@ public sealed class GameInstallTransactionStore
         if (record.Phase != InstallTransactionPhase.PreparingCandidate &&
             record.Phase != InstallTransactionPhase.CandidateReady &&
             record.Phase != InstallTransactionPhase.BackupMovePending &&
-            record.Phase != InstallTransactionPhase.CandidateMovePending)
+            record.Phase != InstallTransactionPhase.CandidateMovePending &&
+            record.Phase != InstallTransactionPhase.Completed)
         {
             throw new InvalidDataException("事务记录包含未知或不支持的阶段。");
         }

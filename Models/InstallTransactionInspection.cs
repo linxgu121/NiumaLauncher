@@ -23,6 +23,12 @@ public sealed class InstallTransactionInspection
     // 集合只读，但其中的事务对象仍然是可变 DTO。
     public IReadOnlyList<GameInstallTransaction> LoadedRecords { get; }
 
+    // 以下集合记录本报告构造时的分类，不作为安装或恢复的执行依据。
+    // 集合只读，但元素仍引用 LoadedRecords 中的 DTO，请勿修改这些对象。
+    public IReadOnlyList<GameInstallTransaction> CompletedRecords { get; }
+
+    public IReadOnlyList<GameInstallTransaction> IncompleteRecords { get; }
+
     // 操作编号 → 读取失败原因。
     public IReadOnlyDictionary<Guid, string> ReadFailures { get; }
 
@@ -50,6 +56,17 @@ public sealed class InstallTransactionInspection
         Discovery = discovery;
 
         LoadedRecords = Array.AsReadOnly(loadedRecords.ToArray());
+
+        // 按创建报告时的登记阶段分组，仅用于展示。
+        CompletedRecords = Array.AsReadOnly(
+            LoadedRecords
+                .Where(record => record.Phase == InstallTransactionPhase.Completed)
+                .ToArray());
+
+        IncompleteRecords = Array.AsReadOnly(
+            LoadedRecords
+                .Where(record => record.Phase != InstallTransactionPhase.Completed)
+                .ToArray());
 
         // 先复制，再包装，避免原字典变化影响已经返回的结果。
         ReadFailures = new ReadOnlyDictionary<Guid, string>(
